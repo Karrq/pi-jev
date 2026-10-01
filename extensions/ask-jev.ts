@@ -3,8 +3,12 @@
  *
  * Commands run here, their combined output goes to the endpoint, and only the answers
  * come back, so 40k tokens of output can be reasoned about without the model ever
- * reading them. For prose the model wants judged, it can run `echo "..."`, which keeps
- * one code path for every source.
+ * reading them. Each command's output is written to its own temp file and the paths are
+ * reported, so the exact lines are one `read` away.
+ *
+ * `state` is context rather than a source: a scope, a constraint, what to exclude. It
+ * is sent in front of the output and is not saved or attributed. Prose to be judged goes
+ * through a command (`echo "..."`), which keeps one code path for every source.
  *
  * One request covers every source. With `perSource: true` each source is asked
  * separately, which costs one request per source but reports which file or command
@@ -55,6 +59,12 @@ const QuestionSpec = Type.Object({
 
 const AskParams = Type.Object({
 	questions: Type.Array(QuestionSpec, { minItems: 1, description: "Typed questions to answer" }),
+	state: Type.Optional(
+		Type.String({
+			description:
+				"Extra context for interpreting the output, sent with it and not saved: a scope, a constraint, or what to exclude. To have prose judged, run `echo` as a command instead.",
+		}),
+	),
 	commands: Type.Optional(
 		Type.Array(Type.String(), {
 			description: "Shell commands to run. Their combined output is sent, not shown to you.",
@@ -150,7 +160,10 @@ export default function (pi: ExtensionAPI) {
 
 				const labelled = blocks.map(blockFor);
 				const model = typeof options.model === "string" ? options.model : undefined;
-				const state = renderBlocks(labelled);
+				// `state` is not a source: it is context for reading the sources, put
+				// in front of them so every question is judged in the same frame.
+				const context = params.state?.trim();
+				const state = context ? `--- context ---\n${context}\n\n${renderBlocks(labelled)}` : renderBlocks(labelled);
 				const started = Date.now();
 
 				let answers: Record<string, JevAnswer>;
@@ -162,7 +175,9 @@ export default function (pi: ExtensionAPI) {
 					// One request per source; the most confident answer per question wins.
 					const best: Record<string, { answer: (typeof answers)[string]; label: string; confidence: number }> = {};
 					for (const block of labelled) {
-						const result = await systemOne(endpoint, block.text, questions, { signal, model });
+						// Context plus this source alone, so per-source still means per source.
+						const scoped = context ? `--- context ---\n${context}\n\n--- source ---\n${block.text}` : block.text;
+						const result = await systemOne(endpoint, scoped, questions, { signal, model });
 						usage = result.usage;
 						endpointName = result.endpoint;
 						for (const [id, answer] of Object.entries(result.answers)) {

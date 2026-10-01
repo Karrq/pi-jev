@@ -83,12 +83,13 @@ With no `pi-jev` key, everything uses `http://127.0.0.1:10610`.
 |---|---|
 | `questions` | Required. Each is `{id?, instructions, type?, criteria?}`, `type` being `noul` (yes/no, the default), `choice` or `score`. `id` defaults to `q1`, `q2`. |
 | `commands` | Shell commands to run. Their combined output goes to the endpoint, never to the conversation. For prose to judge, run `echo "..."`. |
+| `state` | Context for interpreting the output: a scope, a constraint, what to exclude. Sent in front of the output, not saved, not attributed to any source. |
 | `timeout` | Milliseconds to wait for each command before killing it, like the bash tool's `timeout`. Default 30000. |
 | `perSource` | Ask each source separately. One request per source, and every answer then names the source it came from. Off by default, which is one request for everything. |
 
-Every command's full output is written to `tmpdir()/pi-ask-jev-<id>.log` and listed
-with its source, so the exact failing lines are one `read` away instead of a second
-request. `maxHeadChars` (300) quotes the head of each contributing source;
+Each command's full output is written to its own `tmpdir()/pi-ask-jev-<id>.log`, one
+file per command, listed with its source, so the exact failing lines are one `read`
+away instead of a second request. `maxHeadChars` (300) quotes the head of each contributing source;
 `maxQuestions`, `maxCommandBytes`, `commandTimeoutMs` and `model` are also settings.
 
 ```

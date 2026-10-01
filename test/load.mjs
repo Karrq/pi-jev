@@ -96,6 +96,7 @@ if (process.argv.includes("--tools")) {
 	const cases = {
 		ask_jev: {
 			commands: ["echo 'Deploy log: staging healthy, p95 210ms, error rate 0.02%.'"],
+			state: "the p95 target is 250ms",
 			questions: [
 				{ id: "healthy", instructions: "Is the service healthy?" },
 				{ id: "status", type: "score", instructions: "How bad is it?", criteria: ["fine", "degraded", "down"] },
@@ -127,6 +128,7 @@ if (process.argv.includes("--tools")) {
 				{ id: "where", instructions: "Which test suite is failing?" },
 			],
 			commands: ["node -e \"console.log('FAIL src/auth.test.ts\\n  expected 200 got 401')\"", "echo second source"],
+			state: "count only lines starting with FAIL",
 		},
 		ask_jev_paths: {
 			questions: [
