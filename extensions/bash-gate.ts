@@ -23,8 +23,12 @@
  * lands in the ask band whatever the level says: an unsure "low" on `rm -rf` is
  * exactly the case worth a question. Read-only and build commands are exempt, since
  * `grep -rn TODO src` scores 0.54 confidence for reasons that have nothing to do with
- * safety. With no interactive terminal (RPC or print) the ask band follows
- * `nonInteractive`: run it with a warning, or refuse it.
+ * safety.
+ *
+ * With no interactive terminal (RPC or print) nobody can answer the ask band, so
+ * `nonInteractive` decides, and it refuses by default: a command the gate would have
+ * asked you about does not run when there is no you. Set it to "run" to allow it with
+ * a warning instead.
  *
  * A separate "is this safe" question looked redundant, and measuring 18 commands
  * showed why: it never vetoed where risk did not, and it cleared four commands risk
@@ -65,6 +69,7 @@ interface Bands {
 	/** P(high) at or above which the command is refused. */
 	blockAt: number;
 	minConfidence: number;
+	/** What the ask band does when there is no terminal to ask in. */
 	nonInteractive: "run" | "block";
 }
 
@@ -81,7 +86,7 @@ export default function (pi: ExtensionAPI) {
 			askAt: numberOption(options, "askAt", 0.25),
 			blockAt: numberOption(options, "blockAt", 0.5),
 			minConfidence: numberOption(options, "minConfidence", 0.6),
-			nonInteractive: options.nonInteractive === "block" ? "block" : "run",
+			nonInteractive: options.nonInteractive === "run" ? "run" : "block",
 		};
 		const allow = listOption(options, "allow", []);
 		return { endpoint, options, bands, allow };

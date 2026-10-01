@@ -85,12 +85,11 @@ With no `pi-jev` key, everything uses `http://127.0.0.1:10610`.
 | `commands` | Shell commands to run. Their output goes to the endpoint, never to the conversation. |
 | `state` | Inline text to answer about, if you do not need to run anything. |
 | `perSource` | Ask each source separately. One request per source, and every answer then names the source it came from. Off by default, which is one request for everything. |
-| `model` | Override the model for this call. |
-| `headChars` | Characters to quote from each contributing source, so you can see what was read without reading it all. 0 for none. Default 300. |
 
 Every command's full output is written to `tmpdir()/pi-ask-jev-<id>.log` and listed
 with its source, so the exact failing lines are one `read` away instead of a second
-request.
+request. `maxHeadChars` (300) quotes the head of each contributing source;
+`maxQuestions`, `maxCommandBytes`, `commandTimeoutMs` and `model` are also settings.
 
 ```
 source 0: $ npm test 2>&1 | tail -40 (1832 bytes) /tmp/pi-ask-jev-cff636f2.log
@@ -175,7 +174,7 @@ What the knobs mean, all under `overrides["jev-bash-gate"]`:
 | `askAt` | 0.25 | Silent while `P(medium)+P(high)` is below this; above it the command is worth a question. |
 | `blockAt` | 0.5 | Refused at `P(high)` at or above this, or whenever the top level wins outright. |
 | `minConfidence` | 0.6 | Below this, a command that is not read-only is asked whatever the level says. |
-| `nonInteractive` | `"run"` | What "asked" means when there is no terminal to ask in (RPC, print): run it with a warning, or refuse it. |
+| `nonInteractive` | `"block"` | What "asked" means when there is no terminal to ask in (RPC, print). `block` refuses, because nobody can answer the question; `run` allows it with a warning. |
 | `allow` | `[]` | Command prefixes to skip entirely, everywhere. |
 | `timeoutMs` | endpoint's | Per-request timeout override. |
 

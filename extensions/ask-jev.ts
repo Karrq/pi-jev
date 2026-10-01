@@ -17,6 +17,9 @@
  * Settings: overrides["ask-jev"] = {
  *   maxQuestions, maxCommandBytes, commandTimeoutMs, maxHeadChars, model }
  *
+ * `maxHeadChars` quotes the head of each contributing source. The model does not
+ * report offsets, so this is the start of the output, not the matching region.
+ *
  * Toggle: "+extensions/ask-jev.ts" in the package's extension list.
  */
 
@@ -59,13 +62,6 @@ const AskParams = Type.Object({
 	),
 	perSource: Type.Optional(
 		Type.Boolean({ description: "Ask each source separately so every answer names its source (one request per source)" }),
-	),
-	model: Type.Optional(Type.String({ description: "Override the model for this call" })),
-	headChars: Type.Optional(
-		Type.Number({
-			description:
-				"Characters to quote from the start of each source an answer came from (default 300, 0 for none). The model does not report offsets, so this is the head of the file or output, not the matching region.",
-		}),
 	),
 });
 
@@ -124,7 +120,7 @@ export default function (pi: ExtensionAPI) {
 			const maxQuestions = numberOption(options, "maxQuestions", 32);
 			const maxCommandBytes = numberOption(options, "maxCommandBytes", 400_000);
 			const commandTimeoutMs = numberOption(options, "commandTimeoutMs", 30_000);
-			const headChars = params.headChars ?? numberOption(options, "maxHeadChars", 300);
+			const headChars = numberOption(options, "maxHeadChars", 300);
 
 			try {
 				const questions = buildQuestions(params.questions as Spec[], maxQuestions);
@@ -153,7 +149,7 @@ export default function (pi: ExtensionAPI) {
 				if (blocks.length === 0) throw new Error("nothing to ask about: pass state or commands");
 
 				const labelled = blocks.map(blockFor);
-				const model = params.model ?? (typeof options.model === "string" ? options.model : undefined);
+				const model = typeof options.model === "string" ? options.model : undefined;
 				const state = renderBlocks(labelled);
 				const started = Date.now();
 

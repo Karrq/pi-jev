@@ -17,7 +17,6 @@
         "askAt": 0.25,
         "blockAt": 0.5,
         "minConfidence": 0.6,
-        "nonInteractive": "run",
         "allow": []
       },
       "jev-model-router": {
