@@ -3,6 +3,7 @@
  * runs one real request per tool against the configured endpoint.
  *
  *   node test/load.mjs            # load and register only
+ *   node test/load.mjs --schema   # print what the tools look like to the model
  *   node test/load.mjs --live     # also call the tools against the endpoint
  */
 
@@ -21,12 +22,14 @@ const piRequire = createRequire(`${piDir}/package.json`);
 const alias = { typebox: piRequire.resolve("typebox") };
 const jiti = createJiti(import.meta.url, { interopDefault: true, alias });
 
-const registered = { tools: [], commands: [], events: [], virtualModels: [] };
+const schemaMode = process.argv.includes("--schema");
+const registered = { tools: [], commands: [], events: [], virtualModels: [], schema: [] };
 const tools = new Map();
 const stub = {
 	registerTool: (tool) => {
 		tools.set(tool.name, tool);
 		registered.tools.push({ name: tool.name, description: tool.description.slice(0, 60) });
+		if (schemaMode) registered.schema.push(tool);
 	},
 	registerCommand: (name, options) => registered.commands.push(`${name}: ${options.description}`),
 	registerVirtualModel: (model) => registered.virtualModels.push(`${model.provider}/${model.id} (${model.name}) levels=${model.thinkingLevels.join(",")}`),
@@ -75,7 +78,15 @@ for (const file of files) {
 	await factory(stub);
 	console.log(`ok ${file}`);
 }
-console.log("\nregistered:", JSON.stringify(registered, null, 1));
+console.log("\nregistered:", JSON.stringify({ ...registered, schema: registered.schema.map((tool) => tool.name) }, null, 1));
+if (schemaMode) {
+	for (const tool of registered.schema) {
+		console.log(`\n${"=".repeat(76)}\n${tool.name}   label: ${tool.label}\n${"=".repeat(76)}`);
+		console.log(`promptSnippet: ${tool.promptSnippet ?? "(none)"}`);
+		console.log(`\ndescription:\n${tool.description}`);
+		console.log(`\nparameters:\n${JSON.stringify(tool.parameters, null, 1)}`);
+	}
+}
 
 if (process.argv.includes("--tools")) {
 	const { writeFileSync, mkdtempSync } = await import("node:fs");
@@ -116,7 +127,6 @@ if (process.argv.includes("--tools")) {
 				{ id: "where", instructions: "Which test suite is failing?" },
 			],
 			commands: ["node -e \"console.log('FAIL src/auth.test.ts\\n  expected 200 got 401')\"", "echo second source"],
-			headChars: 80,
 		},
 		ask_jev_paths: {
 			questions: [
@@ -132,7 +142,6 @@ if (process.argv.includes("--tools")) {
 				{ id: "count", type: "choice", instructions: "How many tests are failing?", criteria: ["none: zero", "some: at least one", "many: more than five"] },
 			],
 			commands: ["cd /Users/karrq/others/pi-jev && node -e \"console.log('simulated test output: 12 passing, 2 failing')\"", "echo exit=1"],
-			headChars: 120,
 		},
 		jev_file_glob: {
 			paths: ["extensions/*.ts"],
@@ -140,7 +149,6 @@ if (process.argv.includes("--tools")) {
 				{ id: "virtual", instructions: "Does any file register a virtual model?", type: "noul" },
 				{ id: "shared", type: "choice", instructions: "Which file defines the shared drop logic?", criteria: ["src/drop.ts: the drop module", "extensions/dropper.ts: the extension"] },
 			],
-			maxFiles: 8,
 		},
 
 	};

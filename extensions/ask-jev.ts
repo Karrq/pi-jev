@@ -116,7 +116,7 @@ export default function (pi: ExtensionAPI) {
 			"(paths), or the output of shell commands (commands). Prefer this over pasting large output into the " +
 			"conversation: the sources are sent to a System One endpoint and only the answers return. Use it to " +
 			"classify, triage, check claims against a log, or pull facts out of many files in one request.",
-		promptSnippet: "Answer typed questions about files or command output without loading them into context",
+		promptSnippet: "Answer typed questions about command output without loading it into context",
 		parameters: AskParams,
 
 		async execute(_id, params, signal, _onUpdate, ctx) {
