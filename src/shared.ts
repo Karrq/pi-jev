@@ -6,6 +6,37 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { ResolvedEndpoint } from "./config.ts";
 
+/**
+ * Whether a command matches any allowlist pattern.
+ *
+ * A pattern with no wildcard is a prefix, so `npm test` keeps working as it did.
+ * A pattern with `*`, `?` or a character class is matched as a glob against the whole
+ * command: `git *`, `*rm -rf /*`, `npm run (build|test)`.
+ */
+export function matchesAny(command: string, patterns: readonly string[]): string | undefined {
+	for (const pattern of patterns) {
+		if (!pattern) continue;
+		if (!/[*?[\]{}]/.test(pattern)) {
+			if (command.startsWith(pattern)) return pattern;
+			continue;
+		}
+		let regex = "";
+		for (const char of pattern) {
+			if (char === "*") regex += ".*";
+			else if (char === "?") regex += ".";
+			else if ("\\^$.|+()".includes(char)) regex += `\\${char}`;
+			else regex += char;
+		}
+		try {
+			if (new RegExp(`^${regex}$`).test(command)) return pattern;
+		} catch {
+			// A pattern that is not a valid regex is treated as a literal prefix.
+			if (command.startsWith(pattern)) return pattern;
+		}
+	}
+	return undefined;
+}
+
 /** Read a numeric option with a default, from `overrides[<extension>]` in settings.json. */
 export function numberOption(options: Record<string, unknown>, key: string, fallback: number): number {
 	const value = options[key];

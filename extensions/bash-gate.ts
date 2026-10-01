@@ -34,8 +34,10 @@
  * showed why: it never vetoed where risk did not, and it cleared four commands risk
  * flagged, including `git push origin main` at safe 0.92 against risk 1.9.
  *
- * Allowlists: `allow` in settings applies everywhere, `/jev-allow <prefix>` adds a
- * prefix for this session only. A prefix match skips the request entirely.
+ * Allowlists: `allow` in settings applies everywhere, `/jev-allow <pattern>` adds one
+ * for this session only. Patterns without a wildcard are prefixes (`npm test`); with
+ * one they are globs against the whole command (`git *`, `*rm -rf /*`). A match skips
+ * the request entirely.
  *
  * Settings: overrides["jev-bash-gate"] = {
  *   askAt, blockAt, minConfidence, nonInteractive, allow, timeoutMs }
@@ -46,7 +48,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { resolve } from "../src/config.ts";
 import { systemOne } from "../src/client.ts";
-import { listOption, numberOption } from "../src/shared.ts";
+import { listOption, matchesAny, numberOption } from "../src/shared.ts";
 
 const EXTENSION = "jev-bash-gate";
 const ALLOW_ENTRY = "jev-bash-gate.allowed";
@@ -170,8 +172,8 @@ export default function (pi: ExtensionAPI) {
 		if (typeof command !== "string" || !command) return undefined;
 
 		const { endpoint, bands, allow } = settings(ctx.cwd, ctx);
-		const allowed = [...allow, ...sessionAllow(ctx)];
-		if (allowed.some((prefix) => command.startsWith(prefix))) return undefined;
+		const allowedPattern = matchesAny(command, [...allow, ...sessionAllow(ctx)]);
+		if (allowedPattern) return undefined;
 
 		const key = `${ctx.cwd} :: ${command}`;
 		const hit = cache.get(key);
@@ -214,17 +216,18 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("jev-allow", {
-		description: "Let the model run commands starting with a prefix this session: /jev-allow <prefix>",
+		description: "Let the model run matching commands this session: /jev-allow <pattern>",
 		handler: async (args, ctx) => {
-			const prefix = args.trim();
-			if (!prefix) {
+			const pattern = args.trim();
+			if (!pattern) {
 				const current = settings(ctx.cwd, ctx);
 				const session = sessionAllow(ctx);
 				ctx.ui.notify(
 					[
-						"usage: /jev-allow <command prefix>",
+						"usage: /jev-allow <pattern>",
 						"",
-						"Adds the prefix for this session only, and the gate stops asking about those commands.",
+						"Adds the pattern for this session only, and the gate stops asking about matching commands.",
+						"A pattern with no wildcard is a prefix (npm test); with one it is a glob (git *, *rm -rf /*).",
 						`session: ${session.length ? session.join(", ") : "none"}`,
 						`always (settings): ${current.allow.length ? current.allow.join(", ") : "none"}`,
 						"",
@@ -235,8 +238,8 @@ export default function (pi: ExtensionAPI) {
 				);
 				return;
 			}
-			pi.appendEntry(ALLOW_ENTRY, { prefixes: [prefix] });
-			ctx.ui.notify(`jev bash gate: ${prefix} is allowed for this session`, "info");
+			pi.appendEntry(ALLOW_ENTRY, { prefixes: [pattern] });
+			ctx.ui.notify(`jev bash gate: ${pattern} is allowed for this session`, "info");
 		},
 	});
 }

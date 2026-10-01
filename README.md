@@ -84,6 +84,7 @@ With no `pi-jev` key, everything uses `http://127.0.0.1:10610`.
 | `questions` | Required. Each is `{id?, instructions, type?, criteria?}`, `type` being `noul` (yes/no, the default), `choice` or `score`. `id` defaults to `q1`, `q2`. |
 | `commands` | Shell commands to run. Their output goes to the endpoint, never to the conversation. |
 | `state` | Inline text to answer about, if you do not need to run anything. |
+| `timeout` | Milliseconds to wait for each command before killing it, like the bash tool's `timeout`. Default 30000. |
 | `perSource` | Ask each source separately. One request per source, and every answer then names the source it came from. Off by default, which is one request for everything. |
 
 Every command's full output is written to `tmpdir()/pi-ask-jev-<id>.log` and listed
@@ -175,7 +176,7 @@ What the knobs mean, all under `overrides["jev-bash-gate"]`:
 | `blockAt` | 0.5 | Refused at `P(high)` at or above this, or whenever the top level wins outright. |
 | `minConfidence` | 0.6 | Below this, a command that is not read-only is asked whatever the level says. |
 | `nonInteractive` | `"block"` | What "asked" means when there is no terminal to ask in (RPC, print). `block` refuses, because nobody can answer the question; `run` allows it with a warning. |
-| `allow` | `[]` | Command prefixes to skip entirely, everywhere. |
+| `allow` | `[]` | Command patterns to skip entirely, everywhere. Prefixes without a wildcard, globs with one. |
 | `timeoutMs` | endpoint's | Per-request timeout override. |
 
 There is no `mode: notify` any more; that was the old three-mode design and it is

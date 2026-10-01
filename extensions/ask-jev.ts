@@ -14,8 +14,9 @@
  * truncated bash output) and the path is listed with the source, so the exact
  * failing lines are one `read` away instead of a second request.
  *
- * Settings: overrides["ask-jev"] = {
- *   maxQuestions, maxCommandBytes, commandTimeoutMs, maxHeadChars, model }
+ * `timeout` caps each command, like the bash tool's. Settings:
+ * overrides["ask-jev"] = { maxQuestions, maxCommandBytes, commandTimeoutMs,
+ * maxHeadChars, model }
  *
  * `maxHeadChars` quotes the head of each contributing source. The model does not
  * report offsets, so this is the start of the output, not the matching region.
@@ -59,6 +60,9 @@ const AskParams = Type.Object({
 		Type.Array(Type.String(), {
 			description: "Shell commands to run. Their combined output is sent, not shown to you.",
 		}),
+	),
+	timeout: Type.Optional(
+		Type.Number({ description: "Milliseconds to wait for each command before killing it (default 30000)" }),
 	),
 	perSource: Type.Optional(
 		Type.Boolean({ description: "Ask each source separately so every answer names its source (one request per source)" }),
@@ -119,7 +123,7 @@ export default function (pi: ExtensionAPI) {
 			const { endpoint, options } = resolve(ctx.cwd, EXTENSION, ctx.isProjectTrusted());
 			const maxQuestions = numberOption(options, "maxQuestions", 32);
 			const maxCommandBytes = numberOption(options, "maxCommandBytes", 400_000);
-			const commandTimeoutMs = numberOption(options, "commandTimeoutMs", 30_000);
+			const commandTimeoutMs = params.timeout ?? numberOption(options, "commandTimeoutMs", 30_000);
 			const headChars = numberOption(options, "maxHeadChars", 300);
 
 			try {
