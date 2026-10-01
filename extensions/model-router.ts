@@ -9,15 +9,18 @@
  *
  * What Jev is told about each candidate comes from pi's model registry: price per
  * million tokens in and out, context window, and which thinking levels that model
- * accepts. Pi has no capability benchmarks, so anything you know about a model's
- * character goes in `profiles` as a free-text note and is passed through verbatim.
+ * accepts. On top of that, data/aa-intelligence.json carries Artificial Analysis
+ * figures per model *and reasoning effort*, so Jev sees that Opus at medium scores 51
+ * for $1.34 a task while Sonnet at high scores 47 for $1.08, and can weigh the pair
+ * rather than the name. Anything else you know about a model goes in `profiles` as a
+ * free-text note.
  *
  * The questions:
  * - One score per candidate: how well should this model handle the task, weighing
  *   price. The cheapest model that handles it well scores top; a cheap model that
  *   only scrapes by does not. The highest score wins, ties go to the cheaper model.
- * - One score for depth, on exactly the levels the chosen model accepts, so the
- *   level that comes back is a level pi can actually send.
+ * - One score for depth over the levels the chosen model accepts, weighted by what
+ *   each step up costs, since the effort numbers say a step can be worth it or not.
  *
  * Routing rules:
  * - `user` requests are routed by Jev. `continuation` and `retry` stay on the model
@@ -34,6 +37,7 @@
 
 import type { Message, Model } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext, ModelRoute, ModelRouteRequest } from "@earendil-works/pi-coding-agent";
+import { bestIndex, effortLines } from "../src/aa.ts";
 import { resolve } from "../src/config.ts";
 import { systemOne } from "../src/client.ts";
 import { listOption, numberOption, objectOption, stringOption } from "../src/shared.ts";
@@ -89,6 +93,11 @@ function describe(candidate: Candidate, index: number): string {
 		`    limits: ${Math.round(candidate.model.contextWindow / 1000)}k context, ${Math.round(candidate.model.maxTokens / 1000)}k max output`,
 		`    thinking: ${candidate.levels.join(", ")}`,
 	];
+	const efforts = effortLines(candidate.model, candidate.levels);
+	if (efforts) {
+		lines.push(`    Artificial Analysis, by reasoning effort:`);
+		lines.push(...efforts);
+	}
 	if (candidate.note) lines.push(`    notes: ${candidate.note}`);
 	return lines.join("\n");
 }
@@ -181,20 +190,25 @@ export default function (pi: ExtensionAPI) {
 			const depthLevels = advertised.filter((level) => candidates.some((candidate) => candidate.levels.includes(level)));
 			const depthCriteria = depthLevels.length ? depthLevels : (["off"] as Level[]);
 
+			const hasAa = candidates.some((candidate) => effortLines(candidate.model) !== undefined);
 			try {
 				const { endpoint } = resolve(ctx.cwd ?? process.cwd(), EXTENSION, ctx.isProjectTrusted());
 				const questions: Record<string, any> = {};
 				for (const [index, candidate] of candidates.entries()) {
+					const ceiling = bestIndex(candidate.model);
 					questions[`fit_${index}`] = {
 						type: "score",
 						instructions:
-							`How well should ${candidate.label} handle this task, weighing what it costs? The cheapest model that handles it well belongs at the top; a cheap model that only scrapes by does not, however cheap it is.`,
+							`How well should ${candidate.label} handle this task, weighing what it costs? The cheapest model that handles it well belongs at the top; a cheap model that only scrapes by does not, however cheap it is.` +
+							(ceiling !== undefined ? ` Its best measured capability is ${ceiling} on the Artificial Analysis Intelligence Index.` : ""),
 						criteria: FIT_LEVELS,
 					};
 				}
 				questions.depth = {
 					type: "score",
-					instructions: "How much reasoning depth does this task need?",
+					instructions: hasAa
+						? "How much reasoning depth does this task need? Weigh what each step up costs: where a higher effort barely raises the score, stay at the lower one."
+						: "How much reasoning depth does this task need?",
 					criteria: depthCriteria,
 				};
 

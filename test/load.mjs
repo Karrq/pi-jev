@@ -239,9 +239,9 @@ if (process.argv.includes("--route")) {
 		...extra,
 	});
 	const catalog = [
-		{ model: model("anthropic", "claude-opus-5-5", "opus", 5, { reasoning: true, thinkingLevelMap: { off: null, low: "low", medium: "medium", high: "high", xhigh: "max" } }) },
-		{ model: model("anthropic", "claude-sonnet-5-5", "sonnet", 3, { reasoning: true, thinkingLevelMap: { off: null, low: "low", medium: "medium", high: "high", xhigh: "max" } }) },
-		{ model: model("google", "gemini-3-flash", "flash", 0.3, { reasoning: false }) },
+		{ model: model("claude-bridge", "claude-opus-5-5", "Claude Opus 5.5", 4, { reasoning: true, thinkingLevelMap: { off: null, low: "low", medium: "medium", high: "high", xhigh: "max" } }) },
+		{ model: model("claude-bridge", "claude-sonnet-5", "Claude Sonnet 5", 2, { reasoning: true, thinkingLevelMap: { off: null, low: "low", medium: "medium", high: "high", xhigh: "max" } }) },
+		{ model: model("openrouter", "space-bunny-alpha", "Space Bunny Alpha", 0, { reasoning: false }) },
 	];
 	const routeCtx = {
 		cwd: root,
@@ -252,6 +252,18 @@ if (process.argv.includes("--route")) {
 		},
 	};
 	const message = (text) => ({ role: "user", content: text });
+	if (process.env.SHOW_STATE) {
+		// Print the state the router builds, including the Artificial Analysis block.
+		const seen = [];
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = async (url, init) => {
+			seen.push(JSON.parse(init.body).state);
+			return originalFetch(url, init);
+		};
+		await definition.route({ reason: "user", messages: [message("rename a variable across 40 files")], thinkingLevel: "medium" }, routeCtx);
+		globalThis.fetch = originalFetch;
+		console.log(seen.at(-1));
+	}
 	for (const [label, request] of [
 		["user, simple task", { reason: "user", messages: [message("rename a variable across 40 files")], thinkingLevel: "medium" }],
 		["user, hard task", { reason: "user", messages: [message("design a distributed lock protocol and prove it correct under partitions")], thinkingLevel: "medium" }],

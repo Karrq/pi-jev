@@ -209,9 +209,43 @@ rather than names alone:
     notes: good all-rounder for everyday coding work
 ```
 
-`notes` is the only part pi does not know. It comes from `profiles` in settings and is
-passed through verbatim, which is where anything you know about a model goes (that one
-is better at formal proofs, that its low tier matches another model's high tier).
+On top of that, `data/aa-intelligence.json` carries Artificial Analysis figures per
+model *and reasoning effort*, because the site treats those as separate entities: Opus
+5.5 at medium is index 51 for $1.34 a task, Sonnet 5.5 at high is 47 for $1.08. The
+router passes that table through as it stands.
+
+```
+[0] claude-bridge/claude-opus-5-5
+    price: $4.00/M input, $20.00/M output
+    limits: 200k context, 64k max output
+    thinking: low, medium, high, xhigh
+    Artificial Analysis, by reasoning effort:
+       low      index 42, $0.55/task, 71.8 tok/s
+       medium   index 51, $1.34/task, 71.2 tok/s
+       high     index 54, $1.82/task, 72.5 tok/s
+       xhigh    index 56, $3.46/task, 77.6 tok/s
+     * max      index 58, $5.98/task, 89.8 tok/s
+       (* a setting pi cannot select for this model)
+```
+
+A row marked `*` describes a setting pi would never send, which is worth seeing rather
+than hiding: Claude Sonnet 5 has exactly one Artificial Analysis row, its own
+maximum-effort default at index 38, and pi would run it at low, medium or high. That
+is the weakest row in the table, so do not read it as "Sonnet 5 at medium scores 38".
+
+`notes` in `profiles` is still there for anything the numbers do not say, and is passed
+through verbatim.
+
+Refresh the file by hand when you want new numbers:
+
+```
+node tools/aa-intelligence.mjs
+```
+
+The page list in that script is the only thing to edit. It reads the four stat tiles
+and the pricing sentence each model page server-renders. Latency is not among them, so
+it is absent rather than guessed, and a model Artificial Analysis has not evaluated yet
+comes back as `index not measured` (Sonnet 5.5 at low, as of 2026-10-01).
 
 The questions are:
 
@@ -221,7 +255,8 @@ The questions are:
   `poorly`, `adequately`, `well`, `expertly`.
 - **depth**, one score over the levels `jev/auto` advertises, so the answer is a level
   pi can send. The winner's own levels narrow it further, and a model that cannot think
-  gets `off`.
+  gets `off`. With Artificial Analysis data present the instructions also ask it to weigh
+  what each step up costs, since the table shows where a step is not worth its price.
 
 The highest fit wins. Models within `tieMargin` (0.25) of it count as tied and the
 cheapest of those takes it, which is where the cost preference actually lands: the
@@ -242,14 +277,13 @@ decision is one request, 400-600ms locally.
 }
 ```
 
-Measured against the local server on three tasks, with notes in place: a mechanical
-rename scored opus 3.00, sonnet 3.00, flash 1.42 with depth `low`, so the tie went to
-sonnet; a distributed-lock design scored 3.04 / 2.98 / 1.00 with depth `high`, again
-sonnet. Two caveats worth knowing. The gap between opus and sonnet is inside the noise
-(about 0.06), so this router cannot really tell strong models apart and leans on price;
-if you want opus for hard work, say so in `profiles`. And notes swing hard: "struggles
-with multi-step reasoning" dropped flash from 2.88 to 1.42 on a mechanical rename, so
-keep them specific rather than disparaging.
+With no benchmark data at all, opus and sonnet landed 0.06 apart on every task, which
+is inside the noise, and the router always bought the cheaper one. With the Artificial
+Analysis table in the state, the same two prompts route differently: a mechanical
+rename goes to `claude-sonnet-5` at low, a distributed-lock design goes to
+`claude-opus-5-5`. Free-text notes swing hard in the other direction, so prefer the
+numbers: "struggles with multi-step reasoning" dropped one model from 2.88 to 1.42 on a
+rename that was never multi-step.
 
 ## Question types
 
