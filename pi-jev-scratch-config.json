@@ -20,7 +20,7 @@
         "allow": []
       },
       "jev-model-router": {
-        "fallback": "anthropic/claude-sonnet-5"
+        "fallback": "claude-bridge/claude-sonnet-5-5"
       }
     }
   },

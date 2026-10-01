@@ -61,7 +61,7 @@ settings file (user level, then project level once trusted):
     "overrides": {
       "ask-jev": { "maxCommandBytes": 400000, "commandTimeoutMs": 30000 },
       "jev-bash-gate": { "askAt": 0.25, "blockAt": 0.5, "minConfidence": 0.6 },
-      "jev-model-router": { "fallback": "anthropic/claude-sonnet-5" }
+      "jev-model-router": { "fallback": "claude-bridge/claude-sonnet-5-5" }
     }
   }
 }

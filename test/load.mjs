@@ -240,7 +240,7 @@ if (process.argv.includes("--route")) {
 	});
 	const catalog = [
 		{ model: model("claude-bridge", "claude-opus-5-5", "Claude Opus 5.5", 4, { reasoning: true, thinkingLevelMap: { off: null, low: "low", medium: "medium", high: "high", xhigh: "max" } }) },
-		{ model: model("claude-bridge", "claude-sonnet-5", "Claude Sonnet 5", 2, { reasoning: true, thinkingLevelMap: { off: null, low: "low", medium: "medium", high: "high", xhigh: "max" } }) },
+		{ model: model("claude-bridge", "claude-sonnet-5-5", "Claude Sonnet 5.5", 2, { reasoning: true, thinkingLevelMap: { off: null, low: "low", medium: "medium", high: "high", xhigh: "max" } }) },
 		{ model: model("claude-bridge", "claude-haiku-4-5", "Claude Haiku 4.5", 1, { reasoning: false }) },
 		{ model: model("openrouter", "space-bunny-alpha", "Space Bunny Alpha", 0, { reasoning: false }) },
 	];

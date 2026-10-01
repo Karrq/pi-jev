@@ -65,81 +65,69 @@
 			"model": "claude-bridge/claude-opus-5-5"
 		},
 		{
-			"slug": "claude-sonnet-5",
-			"url": "https://artificialanalysis.ai/models/claude-sonnet-5",
-			"label": "Claude Sonnet 5 (Adaptive Reasoning, Max Effort)",
-			"index": 38,
-			"outputTokensPerSecond": 80,
-			"costPerTaskUsd": 5.09,
-			"outputTokensPerTask": "370M",
-			"priceIn": 2,
-			"priceOut": 10,
-			"model": "claude-bridge/claude-sonnet-5"
-		},
-		{
 			"slug": "claude-sonnet-5-5",
 			"url": "https://artificialanalysis.ai/models/claude-sonnet-5-5",
 			"label": "Claude Sonnet 5.5 (Adaptive Reasoning, Max Effort, Default Fallback)",
 			"index": 56,
-			"outputTokensPerSecond": 139.1,
+			"outputTokensPerSecond": 139,
 			"costPerTaskUsd": 7.62,
 			"outputTokensPerTask": "410M",
 			"priceIn": 2,
 			"priceOut": 10,
-			"model": "claude-sonnet-5-5"
+			"model": "claude-bridge/claude-sonnet-5-5"
 		},
 		{
 			"slug": "claude-sonnet-5-5-low",
 			"url": "https://artificialanalysis.ai/models/claude-sonnet-5-5-low",
 			"label": "Claude Sonnet 5.5 (low with fallback)",
-			"outputTokensPerSecond": 88.2,
+			"outputTokensPerSecond": 88.6,
 			"outputTokensPerTask": "N/A",
 			"priceIn": 2,
 			"priceOut": 10,
-			"model": "claude-sonnet-5-5"
+			"model": "claude-bridge/claude-sonnet-5-5"
 		},
 		{
 			"slug": "claude-sonnet-5-5-medium",
 			"url": "https://artificialanalysis.ai/models/claude-sonnet-5-5-medium",
 			"label": "Claude Sonnet 5.5 (Adaptive Reasoning, Medium Effort, Default Fallback)",
 			"index": 41,
-			"outputTokensPerSecond": 91.7,
+			"outputTokensPerSecond": 92,
 			"costPerTaskUsd": 0.59,
 			"outputTokensPerTask": "29M",
 			"priceIn": 2,
 			"priceOut": 10,
-			"model": "claude-sonnet-5-5"
+			"model": "claude-bridge/claude-sonnet-5-5"
 		},
 		{
 			"slug": "claude-sonnet-5-5-high",
 			"url": "https://artificialanalysis.ai/models/claude-sonnet-5-5-high",
 			"label": "Claude Sonnet 5.5 (Adaptive Reasoning, High Effort, Default Fallback)",
 			"index": 47,
-			"outputTokensPerSecond": 94.4,
+			"outputTokensPerSecond": 95.1,
 			"costPerTaskUsd": 1.08,
 			"outputTokensPerTask": "50M",
 			"priceIn": 2,
 			"priceOut": 10,
-			"model": "claude-sonnet-5-5"
+			"model": "claude-bridge/claude-sonnet-5-5"
 		},
 		{
 			"slug": "claude-sonnet-5-5-xhigh",
 			"url": "https://artificialanalysis.ai/models/claude-sonnet-5-5-xhigh",
 			"label": "Claude Sonnet 5.5 (Adaptive Reasoning, Xhigh Effort, Default Fallback)",
 			"index": 52,
-			"outputTokensPerSecond": 103.1,
+			"outputTokensPerSecond": 104.9,
 			"costPerTaskUsd": 2.74,
 			"outputTokensPerTask": "100M",
 			"priceIn": 2,
 			"priceOut": 10,
-			"model": "claude-sonnet-5-5"
+			"model": "claude-bridge/claude-sonnet-5-5"
 		},
 		{
 			"slug": "claude-4-5-haiku",
 			"url": "https://artificialanalysis.ai/models/claude-4-5-haiku",
 			"label": "Claude 4.5 Haiku (Non-reasoning)",
 			"index": 15,
-			"outputTokensPerSecond": 86.8,
+			"outputTokensPerSecond": 87.8,
 			"outputTokensPerTask": "N/A",
 			"priceIn": 1,
 			"priceOut": 5,

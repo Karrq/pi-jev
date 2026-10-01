@@ -28,12 +28,11 @@ const PAGES = [
 	["claude-opus-5-5-medium", "claude-bridge/claude-opus-5-5"],
 	["claude-opus-5-5-high", "claude-bridge/claude-opus-5-5"],
 	["claude-opus-5-5-xhigh", "claude-bridge/claude-opus-5-5"],
-	["claude-sonnet-5", "claude-bridge/claude-sonnet-5"],
-	["claude-sonnet-5-5", "claude-sonnet-5-5"],
-	["claude-sonnet-5-5-low", "claude-sonnet-5-5"],
-	["claude-sonnet-5-5-medium", "claude-sonnet-5-5"],
-	["claude-sonnet-5-5-high", "claude-sonnet-5-5"],
-	["claude-sonnet-5-5-xhigh", "claude-sonnet-5-5"],
+	["claude-sonnet-5-5", "claude-bridge/claude-sonnet-5-5"],
+	["claude-sonnet-5-5-low", "claude-bridge/claude-sonnet-5-5"],
+	["claude-sonnet-5-5-medium", "claude-bridge/claude-sonnet-5-5"],
+	["claude-sonnet-5-5-high", "claude-bridge/claude-sonnet-5-5"],
+	["claude-sonnet-5-5-xhigh", "claude-bridge/claude-sonnet-5-5"],
 	["claude-4-5-haiku", "claude-bridge/claude-haiku-4-5"],
 ];
 
