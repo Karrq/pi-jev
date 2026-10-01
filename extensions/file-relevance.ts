@@ -1,40 +1,45 @@
 /**
- * jev-file-relevance: answer questions about a file, chunking it when it is large.
+ * jev-file-relevance: answer questions about files, chunking them when large.
  *
- * A small file is one request. A large one is split into overlapping chunks and
- * asked separately, because accuracy on a single long state falls off past a few
- * thousand tokens: per question the most confident chunk wins, and the chunk index
- * is reported so the caller can read the right part of the file itself.
+ * One request can cover several files and globs: the state is the files with
+ * their resolved paths as labels, and each answer reports which file (and chunk)
+ * it came from. A file that fits in one chunk is asked whole; a larger one is split
+ * into overlapping chunks, because accuracy on a single long state falls off past a
+ * few thousand tokens. Per question the most confident chunk wins.
  *
- * Settings: overrides["jev-file-relevance"] = { chunkChars, overlapChars, maxChunks, maxQuestions, concurrency }
+ * Settings: overrides["jev-file-relevance"] = { chunkChars, overlapChars, maxChunks,
+ * maxFiles, maxFileBytes, maxQuestions, concurrency }
  *
  * Toggle: "+extensions/file-relevance.ts" in the package's extension list.
  */
 
-import { readFile } from "node:fs/promises";
-import { isAbsolute, resolve as resolvePath } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { resolve } from "../src/config.ts";
 import { systemOne } from "../src/client.ts";
 import { distribution, formatAnswer, topLabel, type JevAnswer, type JevQuestion } from "../src/types.ts";
 import { failure, numberOption, text } from "../src/shared.ts";
+import { readPathPatterns, type SourceBlock } from "../src/sources.ts";
 
 const EXTENSION = "jev-file-relevance";
 
 const FileParams = Type.Object({
-	path: Type.String({ description: "File to read, absolute or relative to the working directory" }),
+	paths: Type.Array(
+		Type.String({ description: "File or glob, relative to the working directory or absolute. Glob patterns are expanded." }),
+		{ minItems: 1, description: "Files to read" },
+	),
 	questions: Type.Array(
 		Type.Object({
 			id: Type.Optional(Type.String()),
-			instructions: Type.String({ description: "What to determine from the file" }),
+			instructions: Type.String({ description: "What to determine from the files" }),
 			type: Type.Optional(Type.Union([Type.Literal("noul"), Type.Literal("choice"), Type.Literal("score")])),
 			criteria: Type.Optional(Type.Array(Type.String(), { description: "choice/score criteria, 'label: description' for choice" })),
 		}),
-		{ minItems: 1, description: "Typed questions to answer about the file" },
+		{ minItems: 1, description: "Typed questions to answer about the files" },
 	),
-	chunkChars: Type.Optional(Type.Number({ description: "Characters per chunk when the file is large (default 16000, about 4k tokens)" })),
-	maxChunks: Type.Optional(Type.Number({ description: "Stop after this many chunks (default 8)" })),
+	chunkChars: Type.Optional(Type.Number({ description: "Characters per chunk when a file is large (default 16000, about 4k tokens)" })),
+	maxChunks: Type.Optional(Type.Number({ description: "Stop after this many chunks per file (default 8)" })),
+	maxFiles: Type.Optional(Type.Number({ description: "Stop after this many files (default 20)" })),
 });
 
 interface Spec {
@@ -70,42 +75,45 @@ export function buildQuestions(specs: Spec[]): Record<string, JevQuestion> {
 }
 
 export interface Chunk {
+	source: number;
 	index: number;
 	start: number;
 	end: number;
 	text: string;
 }
 
-export function chunkText(text: string, chunkChars: number, overlapChars: number, maxChunks: number): { chunks: Chunk[]; truncated: boolean } {
-	if (text.length <= chunkChars) return { chunks: [{ index: 0, start: 0, end: text.length, text }], truncated: false };
+export function chunkFile(block: SourceBlock, chunkChars: number, overlapChars: number, maxChunks: number): { chunks: Chunk[]; truncated: boolean } {
+	if (block.text.length <= chunkChars) {
+		return { chunks: [{ source: -1, index: 0, start: 0, end: block.text.length, text: block.text }], truncated: false };
+	}
 	const chunks: Chunk[] = [];
 	const step = Math.max(1, chunkChars - overlapChars);
-	for (let start = 0; start < text.length && chunks.length < maxChunks; start += step) {
-		const end = Math.min(text.length, start + chunkChars);
-		chunks.push({ index: chunks.length, start, end, text: text.slice(start, end) });
-		if (end === text.length) return { chunks, truncated: false };
+	for (let start = 0; start < block.text.length && chunks.length < maxChunks; start += step) {
+		const end = Math.min(block.text.length, start + chunkChars);
+		chunks.push({ source: -1, index: chunks.length, start, end, text: block.text.slice(start, end) });
+		if (end === block.text.length) return { chunks, truncated: false };
 	}
 	return { chunks, truncated: true };
 }
 
 /** Most confident answer per question across chunks. */
-function bestAnswer(current: JevAnswer | undefined, candidate: JevAnswer): JevAnswer {
-	if (!current) return candidate;
-	const scoreOf = (answer: JevAnswer) =>
-		answer.type === "noul" ? Math.abs(answer.noul - 0.5) * 2 : answer.confidence;
-	return scoreOf(candidate) > scoreOf(current) ? candidate : current;
+function betterThan(current: JevAnswer | undefined, candidate: JevAnswer): boolean {
+	if (!current) return true;
+	const scoreOf = (answer: JevAnswer) => (answer.type === "noul" ? Math.abs(answer.noul - 0.5) * 2 : answer.confidence);
+	return scoreOf(candidate) > scoreOf(current);
 }
 
 async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T, index: number) => Promise<R>): Promise<R[]> {
 	const results: R[] = new Array(items.length);
 	let next = 0;
-	const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
-		while (next < items.length) {
-			const index = next++;
-			results[index] = await fn(items[index], index);
-		}
-	});
-	await Promise.all(workers);
+	await Promise.all(
+		Array.from({ length: Math.min(limit, items.length) }, async () => {
+			while (next < items.length) {
+				const index = next++;
+				results[index] = await fn(items[index], index);
+			}
+		}),
+	);
 	return results;
 }
 
@@ -114,10 +122,10 @@ export default function (pi: ExtensionAPI) {
 		name: "jev_file",
 		label: "Jev File Relevance",
 		description:
-			"Answer typed questions about a file by reading it in chunks: per question the most confident chunk wins, " +
-			"with the chunk's character range reported. Use to check whether a file answers a question, or to extract " +
-			"facts from it, without pulling the whole file into context.",
-		promptSnippet: "Answer typed questions about a file, chunked, with the source range reported",
+			"Answer typed questions about one or more files (globs allowed) by reading them in chunks: per question the " +
+			"most confident chunk wins, and the answer names the file and character range. Use to check whether files " +
+			"answer a question, or to extract facts from many of them at once, without loading them into context.",
+		promptSnippet: "Answer typed questions about files, chunked, with the source file and range reported",
 		parameters: FileParams,
 
 		async execute(_id, params, signal, onUpdate, ctx) {
@@ -125,58 +133,101 @@ export default function (pi: ExtensionAPI) {
 			const chunkChars = params.chunkChars ?? numberOption(options, "chunkChars", 16_000);
 			const overlapChars = numberOption(options, "overlapChars", 1_000);
 			const maxChunks = params.maxChunks ?? numberOption(options, "maxChunks", 8);
-			const concurrency = numberOption(options, "concurrency", 4);
+			const maxFiles = params.maxFiles ?? numberOption(options, "maxFiles", 20);
+			const maxFileBytes = numberOption(options, "maxFileBytes", 2 << 20);
+			const concurrency = numberOption(options, "concurrency", 1);
 			const maxQuestions = numberOption(options, "maxQuestions", 12);
 
 			try {
-				const path = isAbsolute(params.path) ? params.path : resolvePath(ctx.cwd, params.path);
-				const file = await readFile(path, "utf8");
-				const { chunks, truncated } = chunkText(file, chunkChars, overlapChars, maxChunks);
+				const found = await readPathPatterns(params.paths, { cwd: ctx.cwd, maxFileBytes, maxFiles });
+				if (found.blocks.length === 0) {
+					throw new Error(`no files matched: ${params.paths.join(", ")}`);
+				}
 				const questions = buildQuestions(params.questions.slice(0, maxQuestions) as Spec[]);
 
+				const chunks: Chunk[] = [];
+				const truncatedFiles: string[] = [];
+				found.blocks.forEach((block, source) => {
+					const result = chunkFile(block, chunkChars, overlapChars, maxChunks);
+					if (result.truncated) truncatedFiles.push(block.label);
+					for (const chunk of result.chunks) chunks.push({ ...chunk, source });
+				});
+				const totalChars = found.blocks.reduce((sum, block) => sum + block.text.length, 0);
+
 				onUpdate?.({
-					content: [{ type: "text", text: `Reading ${params.path}: ${file.length} chars in ${chunks.length} chunk(s)` }],
-					details: { path, chars: file.length, chunks: chunks.length },
+					content: [
+						{
+							type: "text",
+							text: `Reading ${found.blocks.length} file(s), ${totalChars} chars in ${chunks.length} chunk(s)`,
+						},
+					],
+					details: { files: found.blocks.length, chars: totalChars, chunks: chunks.length },
 				});
 
-				const state = (chunk: Chunk) => `File: ${params.path}\nCharacters ${chunk.start}-${chunk.end} of ${file.length}\n\n${chunk.text}`;
-				const perChunk = await mapLimit(chunks, concurrency, async (chunk) => {
-					const result = await systemOne(endpoint, state(chunk), questions, { signal });
+				const stateOf = (chunk: Chunk) => {
+					const block = found.blocks[chunk.source];
+					const where =
+						found.blocks.length > 1
+							? `File: ${block.label}${chunks.filter((c) => c.source === chunk.source).length > 1 ? ` (chunk ${chunk.index + 1} of several, characters ${chunk.start}-${chunk.end} of ${block.text.length})` : ""}`
+							: `File: ${block.label}`;
+					return `${where}\n\n${chunk.text}`;
+				};
+
+				const startedAll = Date.now();
+				const answers = await mapLimit(chunks, concurrency, async (chunk) => {
+					const result = await systemOne(endpoint, stateOf(chunk), questions, { signal });
 					return { chunk, answers: result.answers, elapsedMs: result.elapsedMs };
 				});
 
-				const best: Record<string, { answer: JevAnswer; chunk: number }> = {};
-				for (const { chunk, answers } of perChunk) {
-					for (const [id, answer] of Object.entries(answers)) {
-						const current = best[id];
-						if (!current || bestAnswer(current.answer, answer) === answer) best[id] = { answer, chunk: chunk.index };
+				const best: Record<string, { answer: JevAnswer; chunk: Chunk }> = {};
+				for (const { chunk, answers: perChunk } of answers) {
+					for (const [id, answer] of Object.entries(perChunk)) {
+						if (betterThan(best[id]?.answer, answer)) best[id] = { answer, chunk };
 					}
 				}
 
 				const lines = Object.entries(best).map(([id, { answer, chunk }]) => {
-					const chunkInfo = chunks.length > 1 ? ` [chunk ${chunk}, chars ${chunks[chunk].start}-${chunks[chunk].end}]` : "";
-					return `${id}: ${formatAnswer(answer)}${chunkInfo}`;
+					const where = `${found.blocks[chunk.source].label} chars ${chunk.start}-${chunk.end}`;
+					return `${id}: ${formatAnswer(answer)} [${where}]`;
 				});
-				const perChunkLines = perChunk.map(
-					({ chunk, answers, elapsedMs }) =>
-						`chunk ${chunk.index} (${chunk.start}-${chunk.end}): ${Object.entries(answers)
+				const perChunkLines = answers.map(
+					({ chunk, answers: perChunk, elapsedMs }) =>
+						`${found.blocks[chunk.source].label} ${chunk.start}-${chunk.end}: ${Object.entries(perChunk)
 							.map(([id, answer]) => `${id}=${topLabel(answer).label}`)
 							.join(", ")} [${elapsedMs}ms]`,
 				);
-				const header =
-					`[jev file ${endpoint.name} ${path}, ${file.length} chars in ${chunks.length} chunk(s), ${perChunk.reduce((s, c) => s + c.elapsedMs, 0)}ms total]` +
-					(truncated ? `\nWARNING: stopped after ${maxChunks} chunks; ${file.length - chunks[chunks.length - 1].end} chars were not read` : "");
+				const totalMs = Date.now() - startedAll;
+				const notes = [
+					...found.missing.map((pattern) => `no match: ${pattern}`),
+					...found.skipped.map((skip) => `skipped ${skip.origin} (${skip.reason})`),
+					...(truncatedFiles.length ? [`read only the first ${maxChunks} chunks of: ${truncatedFiles.join(", ")}`] : []),
+					...(found.blocks.length >= maxFiles ? [`stopped at maxFiles ${maxFiles}`] : []),
+				];
+				const header = `[jev file ${endpoint.name}: ${found.blocks.length} file(s), ${totalChars} chars, ${chunks.length} chunk(s), ${totalMs}ms]`;
 
 				return {
-					...text([header, "", ...lines, "", ...perChunkLines].join("\n")),
+					...text([header, "", ...lines, "", ...perChunkLines, ...(notes.length ? ["", ...notes] : [])].join("\n")),
 					details: {
-						path,
-						chars: file.length,
-						chunks: chunks.map((c) => ({ index: c.index, start: c.start, end: c.end })),
-						truncated,
-						answers: Object.fromEntries(Object.entries(best).map(([id, b]) => [id, b.answer])),
-						sources: Object.fromEntries(Object.entries(best).map(([id, b]) => [id, b.chunk])),
-						distributions: Object.fromEntries(Object.entries(best).map(([id, b]) => [id, distribution(b.answer)])),
+						paths: params.paths,
+						resolvedPaths: found.blocks.map((block) => block.path ?? block.label),
+						labels: found.blocks.map((block) => block.label),
+						files: found.blocks.map((block) => ({ path: block.label, chars: block.text.length, originalBytes: block.originalBytes })),
+						chunks: chunks.map((chunk) => ({
+							file: found.blocks[chunk.source].label,
+							index: chunk.index,
+							start: chunk.start,
+							end: chunk.end,
+						})),
+						answers: Object.fromEntries(Object.entries(best).map(([id, entry]) => [id, entry.answer])),
+						sources: Object.fromEntries(
+							Object.entries(best).map(([id, entry]) => [
+								id,
+								{ file: found.blocks[entry.chunk.source].label, start: entry.chunk.start, end: entry.chunk.end },
+							]),
+						),
+						distributions: Object.fromEntries(Object.entries(best).map(([id, entry]) => [id, distribution(entry.answer)])),
+						notes,
+						elapsedMs: totalMs,
 					},
 				};
 			} catch (error) {

@@ -1,182 +1,148 @@
 /**
- * jev-model-router: pick which model should handle a task.
+ * jev-model-router: a virtual model that lets Jev pick the physical model.
  *
- * The state is the task description plus the candidate list (the models pi has
- * enabled, unless you pass your own), and the questions are which model fits,
- * how much reasoning depth it needs, and whether the cheap model is enough. The
- * router only advises: the tool returns the pick, and `/jev-route --apply` switches
- * the session's model.
+ * Registers `jev/auto` (provider `jev`, id `auto`). Select it like any other
+ * model, put it in `defaultModel` or `enabledModels`, and every request is routed:
+ * Jev reads the latest user message and chooses which enabled model handles it, plus
+ * a thinking level. Because the choice happens inside a virtual model, subagents and
+ * any allowlist that names models work unchanged: they just see `jev/auto`.
  *
- * Settings: overrides["jev-model-router"] = { maxCandidates, thinkingLevels, alwaysApply }
+ * Routing rules:
+ * - `user` requests are routed by Jev. The state holds the candidate list and the
+ *   last user message, and the questions are which model fits, how much reasoning
+ *   depth it needs, and whether the cheapest candidate is enough.
+ * - `continuation` and `retry` stay on the model that handled the turn, which keeps
+ *   prompt caches and thinking signatures valid.
+ * - `direct` requests (compaction summaries, extension calls) go to `fallback`.
+ * - If Jev is unreachable or returns nothing usable, `fallback` answers instead.
+ *
+ * Settings: overrides["jev-model-router"] = {
+ *   fallback, candidates, thinkingLevels, maxCandidates }
  *
  * Toggle: "+extensions/model-router.ts" in the package's extension list.
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { Type } from "typebox";
+import type { Message } from "@earendil-works/pi-ai";
+import type { ExtensionAPI, ExtensionContext, ModelRoute, ModelRouteRequest } from "@earendil-works/pi-coding-agent";
 import { resolve } from "../src/config.ts";
 import { systemOne } from "../src/client.ts";
-import { formatAnswer } from "../src/types.ts";
-import { failure, listOption, numberOption, text } from "../src/shared.ts";
+import { listOption, numberOption, stringOption } from "../src/shared.ts";
 
 const EXTENSION = "jev-model-router";
 
-const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+const VIRTUAL_PROVIDER = "jev";
+const VIRTUAL_ID = "auto";
 
-const RouteParams = Type.Object({
-	task: Type.String({ description: "What the model has to do" }),
-	candidates: Type.Optional(
-		Type.Array(Type.String(), {
-			description: "Model ids to choose from (default: the models pi has enabled)",
-		}),
-	),
-	constraints: Type.Optional(
-		Type.String({ description: "Extra facts the choice must respect, e.g. 'no network, 30s budget'" }),
-	),
-	apply: Type.Optional(Type.Boolean({ description: "Switch the session model when a candidate matches (default false)" })),
-});
+const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+type Level = (typeof THINKING_LEVELS)[number];
 
-/** Model ids pi can actually switch to, in the form pi uses (provider/id). */
-function sessionCandidates(ctx: any): string[] {
+function lastUserText(messages: readonly Message[]): string {
+	const content = messages.filter((message) => message.role === "user").at(-1)?.content ?? "";
+	if (typeof content === "string") return content;
+	return content.flatMap((block) => (block.type === "text" ? [block.text] : [])).join("\n");
+}
+
+/** Enabled physical models, as `provider/id`, ignoring the virtual one. */
+function physicalModels(ctx: ExtensionContext, exclude: { provider: string; id: string }): string[] {
 	const models = ctx.getScopedModels?.() ?? [];
 	const ids = models
-		.map((entry: any) => (typeof entry === "string" ? entry : `${entry.provider ?? ""}/${entry.id ?? entry.modelId ?? ""}`))
-		.filter((id: string) => id && id !== "/");
-	return [...new Set(ids)];
+		.map((entry: any) => {
+			const provider = entry.provider ?? entry.model?.provider ?? "";
+			const id = entry.id ?? entry.modelId ?? entry.model?.id ?? "";
+			return { provider, id, label: provider && id ? `${provider}/${id}` : "" };
+		})
+		.filter((entry) => entry.label && !(entry.provider === exclude.provider && entry.id === exclude.id));
+	return [...new Set(ids.map((entry) => entry.label))];
+}
+
+function findModel(ctx: ExtensionContext, label: string) {
+	const slash = label.indexOf("/");
+	const provider = label.slice(0, slash);
+	const id = label.slice(slash + 1);
+	return ctx.modelRegistry.find(provider, id);
+}
+
+/** Pick the closest allowed thinking level to what Jev asked for. */
+function nearestLevel(requested: number, allowed: Level[]): Level {
+	const clamped = Math.max(0, Math.min(THINKING_LEVELS.length - 1, Math.round(requested)));
+	return allowed[clamped] ?? allowed[allowed.length - 1];
 }
 
 export default function (pi: ExtensionAPI) {
-	async function route(task: string, candidates: string[], constraints: string | undefined, ctx: any, signal?: AbortSignal) {
-		const { endpoint, options } = resolve(ctx.cwd, EXTENSION, ctx.isProjectTrusted());
-		const state = [
-			`Task: ${task}`,
-			constraints ? `Constraints: ${constraints}` : undefined,
-			`Candidate models:\n${candidates.map((id, index) => `[${index}] ${id}`).join("\n")}`,
-		]
-			.filter(Boolean)
-			.join("\n\n");
-		const criteria: Record<string, string> = {};
-		candidates.forEach((id) => (criteria[id] = id));
-		const levels = listOption(options, "thinkingLevels", THINKING_LEVELS).filter((level) => THINKING_LEVELS.includes(level));
-		const questions: Parameters<typeof systemOne>[2] = {
-			model: {
-				type: "choice",
-				instructions: "Which candidate model should handle this task?",
-				criteria,
-			},
-			depth: {
-				type: "score",
-				instructions: "How much reasoning depth does this task need?",
-				criteria: levels.length >= 2 ? levels : ["low", "high"],
-			},
-			cheapest_enough: {
-				type: "noul",
-				instructions: "Can the smallest and cheapest candidate handle this task well enough?",
-				criteria: {
-					true: "The smallest candidate is good enough; quality is not the bottleneck.",
-					false: "The task needs a stronger model to do it properly.",
-				},
-			},
-		};
-		const result = await systemOne(endpoint, state, questions, { signal });
-		const pick = result.answers.model.type === "choice" ? result.answers.model.choice : candidates[0];
-		const depth = result.answers.depth.type === "score" ? result.answers.depth : undefined;
-		return { endpoint, result, pick, depth, candidates };
-	}
+	pi.registerVirtualModel({
+		provider: VIRTUAL_PROVIDER,
+		id: VIRTUAL_ID,
+		name: "Auto (Jev)",
+		thinkingLevels: ["off", "low", "medium", "high", "xhigh"],
+		async route(request: ModelRouteRequest, ctx: ExtensionContext): Promise<ModelRoute> {
+			// Options can only be read from a context, and route() does not get one
+			// until a session starts, so read them through the model registry's ctx.
+			const { options } = resolve(ctx.cwd ?? process.cwd(), EXTENSION, ctx.isProjectTrusted());
+			const fallbackLabel = stringOption(options, "fallback", "");
+			const allowed = listOption(options, "thinkingLevels", ["off", "low", "medium", "high", "xhigh"]) as Level[];
+			const configured = listOption(options, "candidates", []);
+			const maxCandidates = numberOption(options, "maxCandidates", 24);
 
-	function report(result: Awaited<ReturnType<typeof route>>, apply: boolean, applied: string | undefined) {
-		const lines = [
-			`recommended: ${result.pick} (${formatAnswer(result.result.answers.model)})`,
-			`depth: ${result.depth ? formatAnswer(result.depth) : "unknown"}`,
-			`cheapest enough: ${formatAnswer(result.result.answers.cheapest_enough)}`,
-			`[jev ${result.endpoint.name} ${result.result.elapsedMs}ms]`,
-		];
-		if (apply) lines.push(applied ? `session model: ${applied}` : "session model unchanged (candidate not available)");
-		return lines.join("\n");
-	}
+			const candidates = (configured.length ? configured : physicalModels(ctx, { provider: VIRTUAL_PROVIDER, id: VIRTUAL_ID })).slice(0, maxCandidates);
+			const fallback = fallbackLabel || candidates[0];
+			if (!fallback) throw new Error(`jev-model-router: no candidate models. Set overrides["${EXTENSION}"].fallback or enable models.`);
 
-	pi.registerTool({
-		name: "jev_route",
-		label: "Jev Model Router",
-		description:
-			"Choose which model should handle a task from the candidates pi has enabled, using System One. Returns the " +
-			"recommended model id, a reasoning-depth level, and whether the cheapest candidate suffices.",
-		promptSnippet: "Pick the best available model for a task with System One",
-		parameters: RouteParams,
-
-		async execute(_id, params, _signal, _onUpdate, ctx) {
-			const maxCandidates = numberOption(resolve(ctx.cwd, EXTENSION, ctx.isProjectTrusted()).options, "maxCandidates", 24);
-			const candidates = (params.candidates ?? sessionCandidates(ctx)).slice(0, maxCandidates);
-			if (candidates.length < 2) {
-				return text(`jev router needs at least 2 candidates, got ${candidates.length}.`);
+			// Keep the turn together: continuation and retry stay on the same model so
+			// prompt caches and thinking signatures survive.
+			if (request.reason === "continuation" && request.previous) {
+				return { model: request.previous.model, thinkingLevel: request.previous.thinkingLevel };
 			}
+			if (request.reason === "retry" && request.failed) {
+				return { model: request.failed.model, thinkingLevel: request.failed.thinkingLevel };
+			}
+			if (request.reason !== "user" || candidates.length < 2) {
+				const model = findModel(ctx, fallback);
+				if (!model) throw new Error(`jev-model-router: ${fallback} is not in the model catalog`);
+				return { model, thinkingLevel: request.thinkingLevel };
+			}
+
+			const task = lastUserText(request.messages).slice(0, 16_000);
 			try {
-				const routed = await route(params.task, candidates, params.constraints, ctx, ctx.signal);
-				const apply = params.apply ?? false;
-				let applied: string | undefined;
-				if (apply) applied = await switchModel(routed.pick, ctx);
-				return {
-					...text(report(routed, apply, applied)),
-					details: {
-						task: params.task,
-						candidates,
-						recommended: routed.pick,
-						applied,
-						answers: routed.result.answers,
-						elapsedMs: routed.result.elapsedMs,
-						endpoint: routed.endpoint.name,
+				const { endpoint } = resolve(ctx.cwd ?? process.cwd(), EXTENSION, ctx.isProjectTrusted());
+				const result = await systemOne(
+					endpoint,
+					`Task:\n${task}\n\nCandidate models:\n${candidates.map((c, i) => `[${i}] ${c}`).join("\n")}`,
+					{
+						model: {
+							type: "choice",
+							instructions: "Which candidate model should handle this task?",
+							criteria: Object.fromEntries(candidates.map((candidate) => [candidate, candidate])),
+						},
+						depth: {
+							type: "score",
+							instructions: "How much reasoning depth does this task need?",
+							criteria: THINKING_LEVELS as unknown as string[],
+						},
+						cheapest_enough: {
+							type: "noul",
+							instructions: "Can the smallest and cheapest candidate handle this task well enough?",
+							criteria: {
+								true: "The smallest candidate is good enough; capability is not the bottleneck.",
+								false: "The task needs a stronger model to do it properly.",
+							},
+						},
 					},
-				};
+					{ signal: request.signal },
+				);
+
+				const chosen = result.answers.model.type === "choice" ? result.answers.model.choice : undefined;
+				const label = chosen && candidates.includes(chosen) ? chosen : fallback;
+				const model = findModel(ctx, label);
+				if (!model) throw new Error(`${label} is not in the model catalog`);
+
+				const depth = result.answers.depth.type === "score" ? result.answers.depth.score : 2;
+				const thinkingLevel = nearestLevel(depth, allowed);
+				return { model, thinkingLevel };
 			} catch (error) {
-				return failure(resolve(ctx.cwd, EXTENSION, ctx.isProjectTrusted()).endpoint, error);
+				const model = findModel(ctx, fallback);
+				if (!model) throw error;
+				return { model, thinkingLevel: request.thinkingLevel };
 			}
 		},
 	});
-
-	pi.registerCommand("jev-route", {
-		description: "Route the last user message to a model; --apply switches the session model",
-		handler: async (args, ctx) => {
-			const apply = /\b--apply\b/.test(args);
-			const branch = ctx.sessionManager.getBranch();
-			const lastUser = [...branch].reverse().find(
-				(entry) => entry.type === "message" && entry.message.role === "user",
-			);
-			const task =
-				(lastUser?.type === "message" && lastUser.message.role === "user"
-					? lastUser.message.content
-							.filter((part): part is { type: "text"; text: string } => part.type === "text")
-							.map((part) => part.text)
-							.join("\n")
-					: "") || args.replace("--apply", "").trim();
-			if (!task) {
-				ctx.ui.notify("nothing to route: no user message and no argument", "error");
-				return;
-			}
-			const candidates = sessionCandidates(ctx);
-			if (candidates.length < 2) {
-				ctx.ui.notify(`jev router needs at least 2 candidate models, found ${candidates.length}`, "error");
-				return;
-			}
-			try {
-				const routed = await route(task, candidates, undefined, ctx);
-				const applied = apply ? await switchModel(routed.pick, ctx) : undefined;
-				ctx.ui.notify(report(routed, apply, applied), "info");
-			} catch (error) {
-				ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
-			}
-		},
-	});
-
-	/** Switch the session model when the router's pick is one pi has loaded. */
-	async function switchModel(pick: string, ctx: any): Promise<string | undefined> {
-		const models: any[] = ctx.getScopedModels?.() ?? [];
-		const match = models.find((entry: any) => {
-			const id = typeof entry === "string" ? entry : `${entry.provider ?? ""}/${entry.id ?? entry.modelId ?? ""}`;
-			return id === pick;
-		});
-		const model = match?.model ?? match;
-		if (!model || typeof ctx.setModel !== "function") return undefined;
-		const ok = await ctx.setModel(model);
-		return ok ? pick : undefined;
-	}
 }

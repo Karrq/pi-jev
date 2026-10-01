@@ -9,7 +9,7 @@
   },
   "pi": {
     "extensions": [
-      "extensions/decider.ts",
+      "extensions/ask-jev.ts",
       "extensions/dropper.ts",
       "extensions/file-relevance.ts",
       "extensions/bash-gate.ts",

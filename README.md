@@ -1,22 +1,21 @@
 # pi-jev
 
-Five independent pi extensions that answer typed questions about text in one
-request, through a TypeSafe-compatible System One endpoint. No generation on the
-server: the state is read once and every question is answered from it.
+System One decision support for pi. The state is read once and every question is
+answered from it in one request, with no generation on the server.
 
-| Extension | Tool | What it is for |
+| Extension | Exposes | What it is for |
 |---|---|---|
-| `extensions/decider.ts` | `jev_decide` | The general one. Any state, any typed questions. |
-| `extensions/dropper.ts` | `jev_drop` | Triage a pool of 200 items against a goal: keep/drop with probabilities, duplicate detection, importance. |
-| `extensions/file-relevance.ts` | `jev_file` | Answer questions about a file, chunked, reporting the character range each answer came from. |
-| `extensions/bash-gate.ts` | `jev_gate_bash` + `user_bash`/`tool_call` hooks | Check a command's safety and side effects before it runs. |
-| `extensions/model-router.ts` | `jev_route` + `/jev-route` | Pick which enabled model should handle a task, and how much reasoning depth it needs. |
+| `extensions/ask-jev.ts` | `ask_jev` tool, `/jev` | Typed questions about text the model never sees: inline text, files and globs, or the output of shell commands. |
+| `extensions/dropper.ts` | `jev_drop` tool, `/jev-drop` | Triage a pool against a goal: keep/drop with probabilities, duplicates, importance. Reads pi-observational-memory's live pool when run as a command. |
+| `extensions/file-relevance.ts` | `jev_file` tool | Typed questions about one or more files (globs allowed), chunked, with the file and character range behind each answer. |
+| `extensions/bash-gate.ts` | `jev_gate_bash` tool, `tool_call` hook | Risk assessment for commands the model asks to run. |
+| `extensions/model-router.ts` | `jev/auto` virtual model | Jev picks which enabled model handles each request. |
 
 Each extension is a separate entry point, so you load exactly the ones you want.
 
 ## Install
 
-Add the package to `~/.pi/agent/settings.json`:
+Add the package to a settings file:
 
 ```json
 {
@@ -24,31 +23,30 @@ Add the package to `~/.pi/agent/settings.json`:
     {
       "source": "../../others/pi-jev",
       "extensions": [
-        "+extensions/decider.ts",
-        "+extensions/bash-gate.ts",
+        "+extensions/ask-jev.ts",
+        "+extensions/model-router.ts",
         "-extensions/dropper.ts",
         "-extensions/file-relevance.ts",
-        "-extensions/model-router.ts"
+        "-extensions/bash-gate.ts"
       ]
     }
   ]
 }
 ```
 
-`+path` includes one extension and `-path` excludes one. Inclusion is additive: listing
-only the two `+` entries above still loads all five, so every extension you do not
-want needs a `-` entry. Dropping an entry from the list is also fine, as long as
-the ones you keep are spelled out.
+`+path` includes one extension and `-path` excludes one. Inclusion is additive, so
+every extension you do not want needs a `-` entry. `pi config` toggles discovered
+resources interactively, and `pi -e <file>` loads one extension for a single run.
 
-Every extension can also be loaded for a single run with
-`pi -e ~/others/pi-jev/extensions/dropper.ts`, and `pi config` toggles discovered
-resources interactively.
+Project settings (`.pi/settings.json`) load after project trust, so a scratch
+project needs `pi -a`. Use a directory that is not inside another git repository,
+otherwise pi resolves the project root elsewhere and ignores them. See
+`pi-jev-scratch-config.json`.
 
-## Point it at an endpoint
+## Endpoints
 
 Pi has no per-extension settings, so pi-jev reads a `pi-jev` key from the same
-`settings.json` it already reads (user level, then project level `.pi/settings.json`
-once project trust is granted):
+settings file (user level, then project level once trusted):
 
 ```json
 {
@@ -61,95 +59,148 @@ once project trust is granted):
     "model": "gemma-4-26b-a4b",
     "timeoutMs": 120000,
     "overrides": {
-      "jev-bash-gate": { "mode": "ask", "autoAllowAt": 0.9, "maxRiskAt": 0.5 },
-      "jev-dropper":    { "keepAt": 0.5, "duplicateAt": 0.8, "maxItems": 200 },
-      "jev-file-relevance": { "chunkChars": 16000, "maxChunks": 8 }
+      "ask-jev": { "maxCommandBytes": 400000, "commandTimeoutMs": 30000 },
+      "jev-bash-gate": { "mode": "notify", "clearAt": 1.0 },
+      "jev-model-router": { "fallback": "anthropic/claude-sonnet-5" }
     }
   }
 }
 ```
 
-- `endpoint` picks a name from `endpoints`. Switching between your local open-jev
-  and the hosted service is changing that one string.
-- `apiKeyEnv` names an environment variable holding the bearer token; the token
-  itself never goes in settings.
-- `model` is sent with every request. Omit it and the server picks.
-- `overrides["<extension>"]` can also carry its own `endpoint` or `endpoints`, so
-  one extension can talk somewhere else without touching the rest.
+- `endpoint` picks a name from `endpoints`: switching between your local open-jev
+  and the hosted service is changing that string.
+- `apiKeyEnv` names an environment variable holding the bearer token.
+- `overrides["<extension>"]` can also carry its own `endpoint`, so one extension can
+  talk somewhere else without touching the others.
 
-With no `pi-jev` key at all, every extension uses `http://127.0.0.1:10610`.
+With no `pi-jev` key, everything uses `http://127.0.0.1:10610`.
 
-## Per-extension settings
+## The tools
 
-Defaults are in each extension's header comment. Summary:
+### `ask_jev`
 
-- `jev-decider`: `maxQuestions` (32), `maxStateChars` (200000).
-- `jev-dropper`: `keepAt` (0.5), `duplicateAt` (0.8), `maxItems` (200), `maxStateChars` (80000), `includeImportance` (true).
-- `jev-file-relevance`: `chunkChars` (16000), `overlapChars` (1000), `maxChunks` (8), `concurrency` (4), `maxQuestions` (12).
-- `jev-bash-gate`: `mode` (`ask` for user commands), `modelMode` (`notify` for model commands), `autoAllowAt` (0.9), `maxRiskAt` (0.5), `timeoutMs` (endpoint default), `blockWhenUncertain` (false), `allowlist` (prefixes).
-- `jev-model-router`: `maxCandidates` (24), `thinkingLevels` (all), `alwaysApply` (false).
+```json
+{
+  "questions": [{ "instructions": "Are any tests failing?", "id": "failing" }],
+  "commands": ["npm test 2>&1 | tail -40"],
+  "paths": ["src/**/*.ts"],
+  "state": "optional inline text",
+  "perSource": false,
+  "model": "optional override",
+  "headChars": 300
+}
+```
 
-## What the questions look like
+Sources are read or run here and sent to the endpoint; only the answers return, so
+the command output never enters the conversation. `paths` accepts files and globs.
+`perSource: true` asks each source separately, which costs one request per source
+but reports which file or command each answer came from. `headChars` quotes the
+start of each contributing source; the model does not report offsets, so this is
+the head of the file or output, not the matching region.
 
-Three kinds, matching the System One contract:
+### `jev_drop`
 
-- `noul` — a yes/no probability. Best for "is X still needed", "is this safe".
+```json
+{
+  "goal": "fix the failing retry test before the release",
+  "items": [{ "id": "obs-12", "text": "npm test: 1 failing in retry" }],
+  "keepAt": 0.6,
+  "duplicateAt": 0.8
+}
+```
+
+One request for the pool: still needed (yes/no), repeats an earlier item (yes/no),
+importance (5 levels). Keep is `P(needed) >= keepAt` and not a duplicate. The
+result gives per-item probabilities, kept and dropped ids, and characters saved.
+
+`/jev-drop <goal>` runs the same triage over the observations pi-observational-memory
+has recorded in the current session, and prints the verdicts. It writes nothing back
+to memory. With no argument it prints usage and the current thresholds.
+
+### `jev_file`
+
+```json
+{
+  "paths": ["src/auth.ts", "src/**/*.test.ts"],
+  "questions": [
+    { "id": "expiry", "instructions": "Does this return 401 for an expired token?" },
+    { "id": "attempts", "type": "choice", "instructions": "What controls the retries?",
+      "criteria": ["attempts_arg: the parameter", "retry_env: an environment variable"] }
+  ],
+  "chunkChars": 16000,
+  "maxChunks": 8,
+  "maxFiles": 20
+}
+```
+
+Files over `chunkChars` are split with 1k overlap and asked per chunk; the most
+confident chunk wins per question. Every answer names its file and character range,
+and `details.resolvedPaths` lists the absolute paths that matched. Chunks run one at
+a time by default, because a local server serializes requests; raise `concurrency`
+for a hosted endpoint.
+
+### `jev_gate_bash`
+
+```json
+{ "command": "git push --force origin main", "cwd": "/Users/karrq/proj" }
+```
+
+Returns what the command primarily does and a 0-3 risk score. Runs nothing. The
+`tool_call` hook applies the same assessment to commands the model asks for.
+
+## The virtual model
+
+`jev/auto` appears in `/model`, `--model` and the allowlist like any other model.
+Select it once (or set it as `defaultModel`) and every request is routed:
+
+- `user` requests: Jev reads the latest user message and the candidate list, then
+  answers which model fits, how much reasoning depth it needs, and whether the
+  cheapest candidate is enough.
+- `continuation` and `retry` stay on the model that handled the turn, so prompt
+  caches and thinking signatures survive.
+- `direct` requests (compaction summaries, extension calls) go to `fallback`.
+- If the endpoint is unreachable or the answer is unusable, `fallback` answers.
+
+Settings: `fallback` (a `provider/id`), `candidates` (defaults to your enabled
+models), `thinkingLevels`, `maxCandidates`. Each routing decision costs one request,
+300-400ms locally.
+
+## Question types
+
+- `noul` — yes/no probability. Best for "is X needed", "is this safe".
 - `choice` — a label distribution over named options.
 - `score` — a distribution over ordered levels plus the mean level.
 
-Tool input accepts criteria as plain strings, so a choice question is
-`["build: builds software", "delete: deletes files"]`.
-
-## Accuracy
-
-About 0.73 on typed yes/no questions (LocalLLaMA/typed-decisions, Gemma 4 26B A4B),
-and lower on long states. Treat probabilities as evidence, not as truth. That is why
-the bash gate defaults to asking rather than blocking.
+Criteria are plain strings; a choice criterion may carry its own text as
+`"label: description"`.
 
 ## Caveats
 
-## Two prompt findings
-
-- Do not put `criteria` text on yes/no questions. With criteria ("Still needed:
-  contributes information the goal does not have elsewhere"), Gemma 4 answered
-  "not needed" with 98-100% confidence for all five items in a test pool, including
-  the item that stated the failure being fixed. The same questions without criteria
-  separated them cleanly.
-- Asking many questions in one request does not degrade the others. A 15-question
-  request (keep, duplicate and importance per item) gave the same probabilities as
-  the same questions asked alone or in pairs.
-- The local letter readout reads up to 26 option labels; the hosted endpoint
-  accepts more. Keep router candidate lists short.
-## Two things to know about the local server
-
-- Idle unload is off by default in the launchd service. With it on
-  (`OPENJEV_IDLE_UNLOAD_S`), the first request after a long idle gap reloaded the
-  weights in 36s because macOS had dropped them from the file cache, against 2-3s
-  when the weights were still cached. For an interactive bash gate that stall lands
-  on a user waiting to run a command.
-- Requests are serialized. A 200-item dropper holds the model for about a minute.
-- `model-router` only switches the session model from `/jev-route --apply`; the
-  tool itself only advises.
+- About 0.73 accuracy on typed yes/no questions (LocalLLaMA/typed-decisions, Gemma 4
+  26B A4B), lower on long states. Treat probabilities as evidence.
+- Do not put `criteria` text on yes/no questions. With criteria, Gemma 4 answered
+  "not needed" at 98-100% confidence for all five items in a test pool, including the
+  item stating the failure being fixed. The same questions without criteria separated
+  them correctly, so the dropper sends none.
+- A separate "is this safe" question next to a risk score is redundant: across 18
+  commands it never vetoed where risk did not, and cleared four that risk flagged,
+  including `git push origin main` (safe 0.92, risk 1.9). The gate decides on risk.
+- Asking many questions in one request does not degrade the others: 15 questions gave
+  the same probabilities as the same questions asked alone or in pairs.
+- Source attribution is best effort. With chunks asked independently, the winning
+  chunk can differ from where the model actually took the answer from.
+- The local letter readout reads up to 26 option labels; the hosted endpoint accepts
+  more. Keep router candidate lists short.
+- Requests are serialized by the local server. A 200-item dropper holds the model for
+  about a minute and nothing else runs meanwhile.
+- The local server frees its 14.5GB of weights after 15 idle minutes. The next
+  request reloads them: 2-3s if macOS still has them cached, up to 36s if not.
 
 ## Development
 
 ```bash
-node test/load.mjs          # load every extension with pi's jiti, print what registers
-node test/load.mjs --live   # also send one real request per extension to the endpoint
+node test/load.mjs          # load every extension with pi's jiti, print registrations
+node test/load.mjs --live   # one real request per extension
+node test/load.mjs --tools  # execute each tool end to end
+node test/load.mjs --route  # call jev/auto's route() with a stub registry
 ```
-## Trying it without touching your settings
-
-Put the package in a scratch project's `.pi/settings.json` and run pi from there
-with `-a` (trust project files for one process). Use a directory that is not inside
-another git repository, otherwise pi resolves the project root elsewhere and the
-project settings are ignored:
-
-```bash
-mkdir -p ~/pi-jev-scratch/.pi
-cp -r ~/others/pi-jev-scratch-config.json ~/pi-jev-scratch/.pi/settings.json
-cd ~/pi-jev-scratch && pi -a          # interactive
-cd ~/pi-jev-scratch && pi -a list
-```
-
-`~/pi-jev-scratch` is set up that way already. Nothing under `~/.pi/agent` is
-touched, so your other pi instances are unaffected.

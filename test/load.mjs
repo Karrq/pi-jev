@@ -21,7 +21,7 @@ const piRequire = createRequire(`${piDir}/package.json`);
 const alias = { typebox: piRequire.resolve("typebox") };
 const jiti = createJiti(import.meta.url, { interopDefault: true, alias });
 
-const registered = { tools: [], commands: [], events: [] };
+const registered = { tools: [], commands: [], events: [], virtualModels: [] };
 const tools = new Map();
 const stub = {
 	registerTool: (tool) => {
@@ -29,6 +29,7 @@ const stub = {
 		registered.tools.push({ name: tool.name, description: tool.description.slice(0, 60) });
 	},
 	registerCommand: (name, options) => registered.commands.push(`${name}: ${options.description}`),
+	registerVirtualModel: (model) => registered.virtualModels.push(`${model.provider}/${model.id} (${model.name}) levels=${model.thinkingLevels.join(",")}`),
 	on: (event) => registered.events.push(event),
 	registerShortcut: () => {},
 	registerFlag: () => {},
@@ -82,7 +83,7 @@ if (process.argv.includes("--tools")) {
 	const sample = mkdtempSync(join(tmpdir(), "pi-jev-"));
 	writeFileSync(join(sample, "auth.ts"), "export function login(token: string) {\n  if (isExpired(token)) return 401;\n  return 200;\n}\n");
 	const cases = {
-		jev_decide: {
+		ask_jev: {
 			state: "Deploy log: staging healthy, p95 210ms, error rate 0.02%.",
 			questions: [
 				{ id: "healthy", instructions: "Is the service healthy?" },
@@ -102,17 +103,34 @@ if (process.argv.includes("--tools")) {
 			keepAt: 0.5,
 		},
 		jev_file: {
-			path: join(sample, "auth.ts"),
+			paths: [join(sample, "auth.ts")],
 			questions: [
 				{ id: "expiry", instructions: "Does this file return 401 for an expired token?" },
 				{ id: "signature", type: "choice", instructions: "What does login take?", criteria: ["token", "user", "password"] },
 			],
 		},
-		jev_gate_bash: { command: "rm -rf ~" },
-		jev_route: { task: "rename a variable across 40 files" },
+		jev_gate_bash: { command: "git push --force origin main" },
+		ask_jev_sources: {
+			questions: [
+				{ id: "failing", instructions: "Are any tests failing?" },
+				{ id: "count", type: "choice", instructions: "How many tests are failing?", criteria: ["none: zero", "some: at least one", "many: more than five"] },
+			],
+			commands: ["cd /Users/karrq/others/pi-jev && node -e \"console.log('simulated test output: 12 passing, 2 failing')\"", "echo exit=1"],
+			headChars: 120,
+		},
+		jev_file_glob: {
+			paths: ["extensions/*.ts"],
+			questions: [
+				{ id: "virtual", instructions: "Does any file register a virtual model?", type: "noul" },
+				{ id: "shared", type: "choice", instructions: "Which file defines the shared drop logic?", criteria: ["src/drop.ts: the drop module", "extensions/dropper.ts: the extension"] },
+			],
+			maxFiles: 8,
+		},
+
 	};
 	for (const [name, params] of Object.entries(cases)) {
-		const tool = tools.get(name);
+		const toolName = name.startsWith("ask_jev_") ? "ask_jev" : name.startsWith("jev_file_") ? "jev_file" : name;
+		const tool = tools.get(toolName);
 		if (!tool) {
 			console.log(`\n== ${name}: not registered`);
 			continue;
@@ -120,12 +138,13 @@ if (process.argv.includes("--tools")) {
 		const started = Date.now();
 		const result = await tool.execute(`test-${name}`, params, undefined, undefined, ctx);
 		console.log(`\n== ${name} (${Date.now() - started}ms)\n${result.content.map((c) => c.text).join("\n")}`);
+		if (name.startsWith("ask_jev_") || name.startsWith("jev_file_")) console.log("details:", JSON.stringify({ sources: result.details.sources, resolvedPaths: result.details.resolvedPaths, notes: result.details.notes }, null, 1));
 	}
 }
 
-if (!process.argv.includes("--live") && !process.argv.includes("--tools")) process.exit(0);
+if (!["--live", "--tools", "--route"].some((flag) => process.argv.includes(flag))) process.exit(0);
 
-if (!process.argv.includes("--live")) process.exit(0);
+if (!process.argv.includes("--live") && !process.argv.includes("--route")) process.exit(0);
 
 // Live check: one small request per extension through the same client the tools use.
 const { resolve } = await jiti.import(join(root, "src/config.ts"));
@@ -173,3 +192,37 @@ for (const [extension, state, questions] of [
 	);
 }
 
+
+if (process.argv.includes("--route")) {
+	// Call the virtual model's route() directly with a stub registry.
+	const virtuals = new Map();
+	stub.registerVirtualModel = (definition) => virtuals.set(`${definition.provider}/${definition.id}`, definition);
+	const module = await jiti.import(join(root, "extensions", "model-router.ts"));
+	(module.default ?? module)(stub);
+	const definition = virtuals.get("jev/auto");
+	if (!definition) throw new Error("jev/auto was not registered");
+
+	const catalog = [
+		{ provider: "anthropic", id: "claude-haiku-4-5", model: { provider: "anthropic", id: "claude-haiku-4-5", name: "haiku" } },
+		{ provider: "anthropic", id: "claude-opus-5-5", model: { provider: "anthropic", id: "claude-opus-5-5", name: "opus" } },
+	];
+	const routeCtx = {
+		cwd: root,
+		isProjectTrusted: () => false,
+		getScopedModels: () => catalog,
+		modelRegistry: {
+			find: (provider, id) => catalog.find((m) => m.provider === provider && m.id === id)?.model,
+		},
+	};
+	const message = (text) => ({ role: "user", content: text });
+	for (const [label, request] of [
+		["user, simple task", { reason: "user", messages: [message("rename a variable across 40 files")], thinkingLevel: "medium" }],
+		["user, hard task", { reason: "user", messages: [message("design a distributed lock protocol and prove it correct under partitions")], thinkingLevel: "medium" }],
+		["continuation", { reason: "continuation", messages: [], previous: { model: catalog[0].model, thinkingLevel: "high" }, thinkingLevel: "medium" }],
+		["direct", { reason: "direct", messages: [], thinkingLevel: "medium" }],
+	]) {
+		const started = Date.now();
+		const routed = await definition.route(request, routeCtx);
+		console.log(`route ${label.padEnd(18)} -> ${routed.model.provider}/${routed.model.id} @ ${routed.thinkingLevel} (${Date.now() - started}ms)`);
+	}
+}

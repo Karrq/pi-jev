@@ -11,17 +11,27 @@
       }
     },
     "model": "gemma-4-26b-a4b",
-    "timeoutMs": 120000
+    "timeoutMs": 120000,
+    "overrides": {
+      "jev-bash-gate": {
+        "mode": "notify",
+        "clearAt": 1.0,
+        "blockAt": 2.0
+      },
+      "jev-model-router": {
+        "fallback": "anthropic/claude-sonnet-5"
+      }
+    }
   },
   "packages": [
     {
       "source": "/Users/karrq/others/pi-jev",
       "extensions": [
-        "+extensions/decider.ts",
+        "+extensions/ask-jev.ts",
         "+extensions/bash-gate.ts",
-        "-extensions/dropper.ts",
-        "-extensions/file-relevance.ts",
-        "-extensions/model-router.ts"
+        "+extensions/dropper.ts",
+        "+extensions/file-relevance.ts",
+        "+extensions/model-router.ts"
       ]
     }
   ]
