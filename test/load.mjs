@@ -109,7 +109,23 @@ if (process.argv.includes("--tools")) {
 				{ id: "signature", type: "choice", instructions: "What does login take?", criteria: ["token", "user", "password"] },
 			],
 		},
-		jev_gate_bash: { command: "git push --force origin main" },
+		ask_jev_saved: {
+			questions: [
+				{ id: "failing", instructions: "Are any tests failing?" },
+				{ id: "count", type: "choice", instructions: "How many tests are failing?", criteria: ["none: zero", "some: at least one", "many: more than five"] },
+				{ id: "where", instructions: "Which test suite is failing?" },
+			],
+			commands: ["node -e \"console.log('FAIL src/auth.test.ts\\n  expected 200 got 401')\"", "echo second source"],
+			headChars: 80,
+		},
+		ask_jev_paths: {
+			questions: [
+				{ id: "has_gate", instructions: "Does the bash gate refuse commands outright above some probability of high risk?" },
+				{ id: "who_blocks", type: "choice", instructions: "What happens to a command in the top risk band?", criteria: ["refused: it is blocked with the reason", "asked: a dialog asks you", "allowed: it runs with a warning"] },
+			],
+			paths: ["extensions/bash-gate.ts", "extensions/ask-jev.ts"],
+			perSource: true,
+		},
 		ask_jev_sources: {
 			questions: [
 				{ id: "failing", instructions: "Are any tests failing?" },
@@ -138,13 +154,13 @@ if (process.argv.includes("--tools")) {
 		const started = Date.now();
 		const result = await tool.execute(`test-${name}`, params, undefined, undefined, ctx);
 		console.log(`\n== ${name} (${Date.now() - started}ms)\n${result.content.map((c) => c.text).join("\n")}`);
-		if (name.startsWith("ask_jev_") || name.startsWith("jev_file_")) console.log("details:", JSON.stringify({ sources: result.details.sources, resolvedPaths: result.details.resolvedPaths, notes: result.details.notes }, null, 1));
+		if (name.startsWith("ask_jev_") || name.startsWith("jev_file_")) console.log("details:", JSON.stringify({ sources: result.details.sources, saved: (result.details.sourcesRead ?? []).map((s) => s.savedOutput).filter(Boolean), resolvedPaths: result.details.resolvedPaths, notes: result.details.notes }, null, 1));
 	}
 }
 
-if (!["--live", "--tools", "--route"].some((flag) => process.argv.includes(flag))) process.exit(0);
+if (!["--live", "--tools", "--route", "--gate"].some((flag) => process.argv.includes(flag))) process.exit(0);
 
-if (!process.argv.includes("--live") && !process.argv.includes("--route")) process.exit(0);
+if (!["--live", "--route", "--gate"].some((flag) => process.argv.includes(flag))) process.exit(0);
 
 // Live check: one small request per extension through the same client the tools use.
 const { resolve } = await jiti.import(join(root, "src/config.ts"));
@@ -224,5 +240,53 @@ if (process.argv.includes("--route")) {
 		const started = Date.now();
 		const routed = await definition.route(request, routeCtx);
 		console.log(`route ${label.padEnd(18)} -> ${routed.model.provider}/${routed.model.id} @ ${routed.thinkingLevel} (${Date.now() - started}ms)`);
+	}
+}
+
+if (process.argv.includes("--gate")) {
+	// Drive the bash tool_call hook the way pi does when the model asks for a command.
+	const handlers = new Map();
+	stub.on = (event, handler) => handlers.set(event, handler);
+	const module = await jiti.import(join(root, "extensions", "bash-gate.ts"));
+	(module.default ?? module)(stub);
+	const hook = handlers.get("tool_call");
+	if (!hook) throw new Error("bash-gate did not register a tool_call handler");
+
+	const notifications = [];
+	const gateCtx = (mode, confirm = false) => ({
+		cwd: root,
+		mode,
+		hasUI: mode === "tui",
+		isProjectTrusted: () => false,
+		signal: undefined,
+		sessionManager: { getBranch: () => [] },
+		ui: { notify: (message) => notifications.push(message), confirm: async () => confirm },
+	});
+	const call = (command) => ({ type: "tool_call", toolName: "bash", toolCallId: "t", input: { command } });
+	const allowedCtx = (mode) => ({
+		...gateCtx(mode, true),
+		sessionManager: {
+			getBranch: () => [{ type: "custom", customType: "jev-bash-gate.allowed", data: { prefixes: ["grep ", "npm "] } }],
+		},
+	});
+
+	for (const [mode, confirm] of [["print", false], ["tui", false], ["tui", true]]) {
+		for (const command of ["ls -la", "npm test", "grep -rn TODO src", "rm -rf /tmp/jev-gate-nothing", "rm -rf node_modules", "rm -rf ~", "git push --force origin main", "chmod -R 777 /"]) {
+			notifications.length = 0;
+			const started = Date.now();
+			const result = await hook(call(command), gateCtx(mode, confirm));
+			const outcome = result?.block ? `BLOCKED (${result.reason.split("\n")[0].slice(0, 60)})` : "ran";
+			console.log(
+				`gate mode=${mode.padEnd(5)} confirm=${String(confirm).padEnd(5)} ${command.padEnd(30)} ${outcome.padEnd(70)} ${Date.now() - started}ms${notifications.length ? ` notified: ${notifications[0].split("\n")[0].slice(0, 40)}` : ""}`,
+			);
+		}
+	}
+
+	console.log("");
+	for (const command of ["grep -rn TODO src", "npm run build", "rm -rf node_modules"]) {
+		const started = Date.now();
+		const result = await hook(call(command), allowedCtx("tui"));
+		const outcome = result?.block ? `BLOCKED: ${result.reason.split("\n")[1] ?? ""}` : "ran";
+		console.log(`gate session-allowed grep,npm | ${command.padEnd(22)} ${outcome} ${Date.now() - started}ms`);
 	}
 }

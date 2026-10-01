@@ -11,6 +11,10 @@
  * separately, which costs one request per source but reports which file or command
  * each answer came from.
  *
+ * Command output is also written to a temp file (the same place pi puts truncated
+ * bash output) and the path is reported, so the exact failing lines are one `read`
+ * away instead of a second request.
+ *
  * Settings: overrides["ask-jev"] = {
  *   maxQuestions, maxSources, maxFileBytes, maxCommandBytes, commandTimeoutMs,
  *   maxHeadChars, model }
@@ -18,6 +22,10 @@
  * Toggle: "+extensions/ask-jev.ts" in the package's extension list.
  */
 
+import { mkdir, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { randomUUID } from "node:crypto";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { resolve } from "../src/config.ts";
@@ -60,6 +68,12 @@ const AskParams = Type.Object({
 		Type.Boolean({ description: "Ask each source separately so every answer names its source (one request per source)" }),
 	),
 	model: Type.Optional(Type.String({ description: "Override the model for this call" })),
+	saveOutput: Type.Optional(
+		Type.Boolean({
+			description:
+				"Write each command's full output to a temp file and report the path, so you can read the exact lines later instead of asking again. Default true.",
+		}),
+	),
 	headChars: Type.Optional(
 		Type.Number({
 			description:
@@ -126,6 +140,7 @@ export default function (pi: ExtensionAPI) {
 			const maxCommandBytes = numberOption(options, "maxCommandBytes", 400_000);
 			const commandTimeoutMs = numberOption(options, "commandTimeoutMs", 30_000);
 			const headChars = params.headChars ?? numberOption(options, "maxHeadChars", 300);
+			const saveOutput = params.saveOutput ?? options.saveOutput !== false;
 
 			try {
 				const questions = buildQuestions(params.questions as Spec[], maxQuestions);
@@ -143,13 +158,20 @@ export default function (pi: ExtensionAPI) {
 				}
 				for (const command of params.commands ?? []) {
 					const result = await runCommand(command, { cwd: ctx.cwd, timeoutMs: commandTimeoutMs, maxBytes: maxCommandBytes, signal });
-					blocks.push({
+					const block: SourceBlock = {
 						label: `$ ${command}`,
 						origin: command,
 						text: result.text,
 						originalBytes: result.originalBytes,
 						truncated: result.truncated,
-					});
+					};
+					if (saveOutput) {
+						const path = join(tmpdir(), `pi-ask-jev-${randomUUID().slice(0, 8)}.log`);
+						await mkdir(tmpdir(), { recursive: true });
+						await writeFile(path, result.text, "utf8");
+						block.savedOutput = path;
+					}
+					blocks.push(block);
 					if (result.timedOut) notes.push(`${command}: timed out after ${commandTimeoutMs}ms`);
 					else if (result.exitCode !== 0) notes.push(`${command}: exit ${result.exitCode}`);
 				}
@@ -199,10 +221,10 @@ export default function (pi: ExtensionAPI) {
 					const from = sources[id]?.[0];
 					return `${id}: ${formatAnswer(answer)}${from ? ` [${from}]` : ""}`;
 				});
-				const sourceLines = labelled.map(
-					(block, index) =>
-						`source ${index}: ${block.label} (${block.originalBytes} bytes${block.truncated ? ", truncated" : ""})`,
-				);
+				const sourceLines = labelled.map((block, index) => {
+					const saved = block.savedOutput ? ` saved: ${block.savedOutput}` : "";
+					return `source ${index}: ${block.label} (${block.originalBytes} bytes${block.truncated ? ", truncated" : ""})${saved}`;
+				});
 				const header = `[ask_jev ${endpointName} ${elapsedMs}ms, ${blocks.length} source(s), ${totalBytes} bytes, ${usage.input_tokens ?? "?"} input tokens]`;
 
 				return {
@@ -214,7 +236,14 @@ export default function (pi: ExtensionAPI) {
 						elapsedMs,
 						endpoint: endpointName,
 						model,
-						sourcesRead: labelled.map((block, index) => ({ index, label: block.label, bytes: block.originalBytes, truncated: block.truncated })),
+						sourcesRead: labelled.map((block, index) => ({
+							index,
+							label: block.label,
+							path: block.path,
+							savedOutput: block.savedOutput,
+							bytes: block.originalBytes,
+							truncated: block.truncated,
+						})),
 						notes,
 						heads:
 							headChars > 0

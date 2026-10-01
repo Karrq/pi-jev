@@ -18,6 +18,8 @@ export interface SourceBlock {
 	origin: string;
 	/** Absolute path for file blocks; unset for command output. */
 	path?: string;
+	/** Temp file holding this block's full text, when it was saved. */
+	savedOutput?: string;
 	text: string;
 	/** Bytes before any cap was applied. */
 	originalBytes: number;

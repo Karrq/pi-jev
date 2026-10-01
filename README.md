@@ -8,7 +8,7 @@ answered from it in one request, with no generation on the server.
 | `extensions/ask-jev.ts` | `ask_jev` tool, `/jev` | Typed questions about text the model never sees: inline text, files and globs, or the output of shell commands. |
 | `extensions/dropper.ts` | `jev_drop` tool, `/jev-drop` | Triage a pool against a goal: keep/drop with probabilities, duplicates, importance. Reads pi-observational-memory's live pool when run as a command. |
 | `extensions/file-relevance.ts` | `jev_file` tool | Typed questions about one or more files (globs allowed), chunked, with the file and character range behind each answer. |
-| `extensions/bash-gate.ts` | `jev_gate_bash` tool, `tool_call` hook | Risk assessment for commands the model asks to run. |
+| `extensions/bash-gate.ts` | `tool_call` hook, `/jev-allow` | Gates commands the model asks to run, by risk band. No tool of its own. |
 | `extensions/model-router.ts` | `jev/auto` virtual model | Jev picks which enabled model handles each request. |
 
 Each extension is a separate entry point, so you load exactly the ones you want.
@@ -60,7 +60,7 @@ settings file (user level, then project level once trusted):
     "timeoutMs": 120000,
     "overrides": {
       "ask-jev": { "maxCommandBytes": 400000, "commandTimeoutMs": 30000 },
-      "jev-bash-gate": { "mode": "notify", "clearAt": 1.0 },
+      "jev-bash-gate": { "askAt": 0.25, "blockAt": 0.5, "minConfidence": 0.6 },
       "jev-model-router": { "fallback": "anthropic/claude-sonnet-5" }
     }
   }
@@ -86,6 +86,7 @@ With no `pi-jev` key, everything uses `http://127.0.0.1:10610`.
   "paths": ["src/**/*.ts"],
   "state": "optional inline text",
   "perSource": false,
+  "saveOutput": true,
   "model": "optional override",
   "headChars": 300
 }
@@ -96,7 +97,9 @@ the command output never enters the conversation. `paths` accepts files and glob
 `perSource: true` asks each source separately, which costs one request per source
 but reports which file or command each answer came from. `headChars` quotes the
 start of each contributing source; the model does not report offsets, so this is
-the head of the file or output, not the matching region.
+the head of the file or output, not the matching region. `saveOutput` writes each
+command's full output to `tmpdir()/pi-ask-jev-<id>.log` and reports the path, so the
+model can `read` the exact failing lines instead of asking again.
 
 ### `jev_drop`
 
@@ -139,14 +142,32 @@ and `details.resolvedPaths` lists the absolute paths that matched. Chunks run on
 a time by default, because a local server serializes requests; raise `concurrency`
 for a hosted endpoint.
 
-### `jev_gate_bash`
+### The bash gate (hook, no tool)
 
-```json
-{ "command": "git push --force origin main", "cwd": "/Users/karrq/proj" }
-```
+Every command the model asks to run is assessed in one request: what it primarily
+does, and a distribution over four risk levels. The decision reads the distribution,
+not the mean, because the model's "high" comes back as 2.998 and a mean comparison
+against 3.0 never fires.
 
-Returns what the command primarily does and a 0-3 risk score. Runs nothing. The
-`tool_call` hook applies the same assessment to commands the model asks for.
+| Command | P(medium)+P(high) | P(high) | Confidence | Outcome |
+|---|---|---|---|---|
+| `ls -la` | 0.00 | 0.00 | 0.88 | silent |
+| `npm test` | 0.11 | 0.00 | 0.57 | silent |
+| `grep -rn TODO src` | 0.00 | 0.00 | 0.54 | silent (read-only, exempt from the confidence floor) |
+| `rm -rf /tmp/x` | 0.21 | 0.06 | 0.42 | asked |
+| `rm -rf node_modules` | 0.51 | 0.07 | 0.34 | asked |
+| `rm -rf ~` | 1.00 | 1.00 | 0.99 | refused |
+| `git push --force origin main` | 1.00 | 1.00 | 1.00 | refused |
+
+Bands: refused when the top level wins or `P(high) >= blockAt` (0.5); silent when the
+level is none/low and `P(medium)+P(high) < askAt` (0.25); asked in between. A
+non-read-only command with confidence below `minConfidence` (0.6) is asked whatever
+the level says. With no interactive terminal the ask band follows `nonInteractive`:
+run with a warning (default) or refuse.
+
+Allowlists skip the request entirely: `allow` in settings applies everywhere,
+`/jev-allow <prefix>` adds a prefix for the current session only (recorded on the
+session branch, so it survives `/tree` navigation but not a new session).
 
 ## The virtual model
 
@@ -189,6 +210,9 @@ Criteria are plain strings; a choice criterion may carry its own text as
   the same probabilities as the same questions asked alone or in pairs.
 - Source attribution is best effort. With chunks asked independently, the winning
   chunk can differ from where the model actually took the answer from.
+- The gate's decisions are only as stable as the model. Between two runs on the
+  same command it has not disagreed on the obvious cases, but `rm -rf /tmp/x` sits
+  at 0.21 elevated against a 0.25 threshold, so tuning `askAt` moves real commands.
 - The local letter readout reads up to 26 option labels; the hosted endpoint accepts
   more. Keep router candidate lists short.
 - Requests are serialized by the local server. A 200-item dropper holds the model for
@@ -203,4 +227,5 @@ node test/load.mjs          # load every extension with pi's jiti, print registr
 node test/load.mjs --live   # one real request per extension
 node test/load.mjs --tools  # execute each tool end to end
 node test/load.mjs --route  # call jev/auto's route() with a stub registry
+node test/load.mjs --gate   # drive the bash hook across commands and modes
 ```

@@ -14,9 +14,11 @@
     "timeoutMs": 120000,
     "overrides": {
       "jev-bash-gate": {
-        "mode": "notify",
-        "clearAt": 1.0,
-        "blockAt": 2.0
+        "askAt": 0.25,
+        "blockAt": 0.5,
+        "minConfidence": 0.6,
+        "nonInteractive": "run",
+        "allow": []
       },
       "jev-model-router": {
         "fallback": "anthropic/claude-sonnet-5"
