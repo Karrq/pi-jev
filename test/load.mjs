@@ -1,0 +1,175 @@
+/**
+ * Loads every extension with pi's own jiti and checks what it registers, then
+ * runs one real request per tool against the configured endpoint.
+ *
+ *   node test/load.mjs            # load and register only
+ *   node test/load.mjs --live     # also call the tools against the endpoint
+ */
+
+import { createJiti } from "/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/node_modules/jiti/lib/jiti.mjs";
+import { readdirSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const root = dirname(dirname(fileURLToPath(import.meta.url)));
+// Pi injects these packages into extensions; standalone they only exist in pi's
+// own node_modules, so point jiti at them the way pi does.
+const piDir = "/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent";
+const { createRequire } = await import("node:module");
+const piRequire = createRequire(`${piDir}/package.json`);
+// Only typebox is imported at runtime; the pi packages are type-only imports.
+const alias = { typebox: piRequire.resolve("typebox") };
+const jiti = createJiti(import.meta.url, { interopDefault: true, alias });
+
+const registered = { tools: [], commands: [], events: [] };
+const tools = new Map();
+const stub = {
+	registerTool: (tool) => {
+		tools.set(tool.name, tool);
+		registered.tools.push({ name: tool.name, description: tool.description.slice(0, 60) });
+	},
+	registerCommand: (name, options) => registered.commands.push(`${name}: ${options.description}`),
+	on: (event) => registered.events.push(event),
+	registerShortcut: () => {},
+	registerFlag: () => {},
+	registerProvider: () => {},
+	registerMessageRenderer: () => {},
+	registerMarkdownTransformer: () => {},
+	registerEntryRenderer: () => {},
+	sendMessage: () => {},
+	sendUserMessage: () => {},
+	appendEntry: () => {},
+	setSessionName: () => {},
+	getSessionName: () => undefined,
+	setLabel: () => {},
+	exec: async () => ({ code: 0, stdout: "", stderr: "" }),
+	getActiveTools: () => [],
+	getAllTools: () => [],
+	setActiveTools: () => {},
+	getCommands: () => [],
+};
+
+const ctx = {
+	cwd: root,
+	mode: "print",
+	hasUI: false,
+	isProjectTrusted: () => false,
+	signal: undefined,
+	sessionManager: { getBranch: () => [] },
+	getScopedModels: () => [
+		{ provider: "anthropic", id: "claude-haiku-4-5", model: { id: "claude-haiku-4-5" } },
+		{ provider: "anthropic", id: "claude-opus-5-5", model: { id: "claude-opus-5-5" } },
+	],
+	scopedModels: [],
+	model: undefined,
+	ui: { notify: (message, level) => console.log(`  [ui.${level}] ${message.split("\n")[0]}`), confirm: async () => false },
+};
+
+const files = readdirSync(join(root, "extensions")).filter((f) => f.endsWith(".ts")).sort();
+for (const file of files) {
+	const path = join(root, "extensions", file);
+	const module = await jiti.import(path);
+	const factory = module.default ?? module;
+	if (typeof factory !== "function") throw new Error(`${file} has no default factory export`);
+	await factory(stub);
+	console.log(`ok ${file}`);
+}
+console.log("\nregistered:", JSON.stringify(registered, null, 1));
+
+if (process.argv.includes("--tools")) {
+	const { writeFileSync, mkdtempSync } = await import("node:fs");
+	const { tmpdir } = await import("node:os");
+	const sample = mkdtempSync(join(tmpdir(), "pi-jev-"));
+	writeFileSync(join(sample, "auth.ts"), "export function login(token: string) {\n  if (isExpired(token)) return 401;\n  return 200;\n}\n");
+	const cases = {
+		jev_decide: {
+			state: "Deploy log: staging healthy, p95 210ms, error rate 0.02%.",
+			questions: [
+				{ id: "healthy", instructions: "Is the service healthy?" },
+				{ id: "status", type: "score", instructions: "How bad is it?", criteria: ["fine", "degraded", "down"] },
+				{ id: "cause", type: "choice", instructions: "What is the most likely next action?", criteria: ["none: do nothing", "investigate: dig into latency"] },
+			],
+		},
+		jev_drop: {
+			goal: "fix the failing login test",
+			items: [
+				{ id: "a", text: "Test fails: expected 200 got 401 at /login" },
+				{ id: "b", text: "Deployed staging at 12:04" },
+				{ id: "c", text: "Login returns 401 when the token is expired, which is the failing case" },
+				{ id: "d", text: "401 Unauthorized reproduced locally with an expired token" },
+				{ id: "e", text: "CI runner runs out of disk space sometimes" },
+			],
+			keepAt: 0.5,
+		},
+		jev_file: {
+			path: join(sample, "auth.ts"),
+			questions: [
+				{ id: "expiry", instructions: "Does this file return 401 for an expired token?" },
+				{ id: "signature", type: "choice", instructions: "What does login take?", criteria: ["token", "user", "password"] },
+			],
+		},
+		jev_gate_bash: { command: "rm -rf ~" },
+		jev_route: { task: "rename a variable across 40 files" },
+	};
+	for (const [name, params] of Object.entries(cases)) {
+		const tool = tools.get(name);
+		if (!tool) {
+			console.log(`\n== ${name}: not registered`);
+			continue;
+		}
+		const started = Date.now();
+		const result = await tool.execute(`test-${name}`, params, undefined, undefined, ctx);
+		console.log(`\n== ${name} (${Date.now() - started}ms)\n${result.content.map((c) => c.text).join("\n")}`);
+	}
+}
+
+if (!process.argv.includes("--live") && !process.argv.includes("--tools")) process.exit(0);
+
+if (!process.argv.includes("--live")) process.exit(0);
+
+// Live check: one small request per extension through the same client the tools use.
+const { resolve } = await jiti.import(join(root, "src/config.ts"));
+const { systemOne } = await jiti.import(join(root, "src/client.ts"));
+const { formatAnswer } = await jiti.import(join(root, "src/types.ts"));
+
+for (const [extension, state, questions] of [
+	[
+		"jev-decider",
+		"Deploy log: staging is healthy, latency p95 210ms, error rate 0.02%.",
+		{ healthy: { type: "noul", instructions: "Is the service healthy?" } },
+	],
+	[
+		"jev-dropper",
+		'Goal: fix the failing login test.\n\nPool:\n[item 0 (a)]\nTest fails: expected 200 got 401 at /login\n\n[item 1 (b)]\nDeployed staging at 12:04\n\n[item 2 (c)]\nLogin returns 401 when the token is expired, which is the failing case',
+		{
+			keep_0: { type: "noul", instructions: "Is item 0 still needed to fix the failing login test?" },
+			imp_0: { type: "score", instructions: "How important is item 0?", criteria: ["irrelevant", "minor", "useful", "important", "critical"] },
+		},
+	],
+	[
+		"jev-file-relevance",
+		'File: src/auth.ts\nCharacters 0-64 of 64\n\nexport function login(token: string) {\n  if (isExpired(token)) return 401;\n}',
+		{ expiry: { type: "noul", instructions: "Does this file return 401 for an expired token?" } },
+	],
+	[
+		"jev-bash-gate",
+		"Working directory: /repo\nCommand: rm -rf node_modules && npm ci",
+		{ safe: { type: "noul", instructions: "Is this command safe to run right now, with no destructive, irreversible or unexpected side effects?" } },
+	],
+	[
+		"jev-model-router",
+		"Task: rename a variable across 40 files\n\nCandidate models:\n[0] anthropic/claude-haiku-4-5\n[1] anthropic/claude-opus-5-5",
+		{ model: { type: "choice", instructions: "Which candidate model should handle this task?", criteria: { "anthropic/claude-haiku-4-5": "cheap fast model", "anthropic/claude-opus-5-5": "expensive strong model" } } },
+	],
+]) {
+	const { endpoint, sources } = resolve(process.cwd(), extension, false);
+	const started = Date.now();
+	const result = await systemOne(endpoint, state, questions);
+	const answers = Object.entries(result.answers)
+		.map(([id, answer]) => `${id}=${formatAnswer(answer)}`)
+		.join("  ");
+	console.log(
+		`live ${extension.padEnd(18)} ${endpoint.name} -> ${endpoint.url} [${sources.join(", ") || "no settings"}] ${Date.now() - started}ms  ${answers}`,
+	);
+}
+

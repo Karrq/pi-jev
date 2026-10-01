@@ -1,0 +1,28 @@
+{
+  "pi-jev": {
+    "endpoint": "local",
+    "endpoints": {
+      "local": {
+        "url": "http://127.0.0.1:10610"
+      },
+      "prod": {
+        "url": "https://api.typesafe.ai",
+        "apiKeyEnv": "JEV_API_KEY"
+      }
+    },
+    "model": "gemma-4-26b-a4b",
+    "timeoutMs": 120000
+  },
+  "packages": [
+    {
+      "source": "/Users/karrq/others/pi-jev",
+      "extensions": [
+        "+extensions/decider.ts",
+        "+extensions/bash-gate.ts",
+        "-extensions/dropper.ts",
+        "-extensions/file-relevance.ts",
+        "-extensions/model-router.ts"
+      ]
+    }
+  ]
+}

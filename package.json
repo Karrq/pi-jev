@@ -1,0 +1,23 @@
+{
+  "name": "pi-jev",
+  "private": true,
+  "version": "0.1.0",
+  "description": "System One decision extensions for pi: dropper, file relevance, bash gate, general decider, model router",
+  "type": "module",
+  "scripts": {
+    "check": "node test/load.mjs"
+  },
+  "pi": {
+    "extensions": [
+      "extensions/decider.ts",
+      "extensions/dropper.ts",
+      "extensions/file-relevance.ts",
+      "extensions/bash-gate.ts",
+      "extensions/model-router.ts"
+    ]
+  },
+  "keywords": [
+    "pi-package",
+    "pi-extension"
+  ]
+}
