@@ -285,6 +285,17 @@ reasoning" dropped one model from 2.88 to 1.42 on a rename that was never multi-
 Criteria are plain strings; a choice criterion may carry its own text as
 `"label: description"`.
 
+## Gotchas
+
+- Pi's `ExtensionContext` declares `getScopedModels()`, and at runtime in 0.99.2 that
+  function does not exist on the context a virtual model's `route()` receives. The
+  enabled models are there as the `scopedModels` property instead. Asking for the
+  function returns nothing, every candidate disappears, and the router throws "no
+  candidate models". The router reads `scopedModels`, falls back to `getScopedModels`
+  if a future version adds it, and finally to the `enabledModels` patterns in settings.
+- A `route()` context is created per request and goes stale after a session
+  replacement, so do not capture one.
+
 ## Caveats
 
 - About 0.73 accuracy on typed yes/no questions (LocalLLaMA/typed-decisions, Gemma 4

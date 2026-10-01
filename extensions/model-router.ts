@@ -41,7 +41,7 @@
 import type { Message, Model } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext, ModelRoute, ModelRouteRequest } from "@earendil-works/pi-coding-agent";
 import { costAtLevel, effortLines } from "../src/aa.ts";
-import { resolve } from "../src/config.ts";
+import { readAgentSettings, resolve } from "../src/config.ts";
 import { systemOne } from "../src/client.ts";
 import { listOption, numberOption, objectOption, stringOption } from "../src/shared.ts";
 
@@ -94,6 +94,51 @@ function describe(candidate: Candidate, index: number): string {
 	}
 	if (candidate.note) lines.push(`    notes: ${candidate.note}`);
 	return lines.join("\n");
+}
+
+/**
+ * The models this session may use, as `provider/id`.
+ *
+ * Pi's context exposes them as `ctx.scopedModels` (an array of `{model}`); the typed
+ * `ctx.getScopedModels()` is declared but absent at runtime, so asking for it returns
+ * nothing and every candidate disappears. Both shapes are accepted, and the enabled
+ * models in settings are the last resort when a context carries neither.
+ */
+function enabledLabels(ctx: ExtensionContext): string[] {
+	const scoped = (ctx as { scopedModels?: unknown }).scopedModels ?? [];
+	const entries = Array.isArray(scoped) ? scoped : [];
+	const labels = entries.map((entry: any) => {
+		const model = entry?.model ?? entry;
+		const provider = model?.provider ?? "";
+		const id = model?.id ?? "";
+		return provider && id ? `${provider}/${id}` : "";
+	});
+	if (labels.length) return [...new Set(labels)];
+	const getter = (ctx as { getScopedModels?: () => readonly unknown[] }).getScopedModels;
+	if (typeof getter === "function") {
+		const fromGetter = getter.call(ctx).map((entry: any) => {
+			const model = entry?.model ?? entry;
+			return model?.provider && model?.id ? `${model.provider}/${model.id}` : "";
+		});
+		if (fromGetter.length) return [...new Set(fromGetter)];
+	}
+	// Last resort: the enabled model patterns in settings, which is where the session's
+	// model set comes from anyway.
+	const patterns = listOption(readAgentSettings(), "enabledModels", []);
+	const expanded = new Set<string>();
+	for (const pattern of patterns) {
+		if (!pattern.includes("*")) {
+			expanded.add(pattern.includes("/") ? pattern : `claude-bridge/${pattern}`);
+			continue;
+		}
+		const [provider, pattern2] = pattern.split("/");
+		if (!pattern2) continue;
+		const prefix = pattern2.split("*")[0];
+		for (const model of ctx.modelRegistry.getAll()) {
+			if (model.provider === provider && model.id.startsWith(prefix)) expanded.add(`${provider}/${model.id}`);
+		}
+	}
+	return [...expanded];
 }
 
 function collect(ctx: ExtensionContext, labels: string[], notes: Record<string, string>, advertised: readonly Level[]): Candidate[] {
@@ -150,14 +195,7 @@ export default function (pi: ExtensionAPI) {
 			const taskChars = numberOption(options, "taskChars", 16_000);
 			const tieMargin = numberOption(options, "tieMargin", 0.5);
 
-			const scoped = (ctx.getScopedModels?.() ?? []).map((entry: any) => entry.model ?? entry);
-			const enabled = [
-				...new Set(
-					scoped
-						.map((model: any) => `${model?.provider ?? ""}/${model?.id ?? ""}`)
-						.filter((label) => label !== "/" && label !== `${VIRTUAL_PROVIDER}/${VIRTUAL_ID}`),
-				),
-			];
+			const enabled = enabledLabels(ctx).filter((label) => label !== `${VIRTUAL_PROVIDER}/${VIRTUAL_ID}`);
 			const configured = listOption(options, "candidates", []);
 			const labels = (configured.length ? configured : enabled).slice(0, maxCandidates);
 			const candidates = collect(ctx, labels, profiles, advertised);

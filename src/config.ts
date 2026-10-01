@@ -146,6 +146,15 @@ function toEndpoint(value: string | EndpointConfig | undefined): EndpointConfig 
  * `extension` picks up `settings.overrides[extension]` first, so one extension can
  * point somewhere else (or at different thresholds) without touching the others.
  */
+/**
+ * The whole of `~/.pi/agent/settings.json`, for the few places that need a pi setting
+ * rather than a `pi-jev` one. Cached by mtime like the rest.
+ */
+export function readAgentSettings(): Record<string, unknown> {
+	const settings = readJson(join(agentDir(), "settings.json"));
+	return isObject(settings) ? settings : {};
+}
+
 export function resolveEndpoint(settings: JevSettings, extension?: string): ResolvedEndpoint {
 	const scoped: JevSettings = { ...settings };
 	const override = extension ? settings.overrides?.[extension] : undefined;

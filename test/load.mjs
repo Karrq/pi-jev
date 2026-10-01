@@ -253,6 +253,22 @@ if (process.argv.includes("--route")) {
 		},
 	};
 	const message = (text) => ({ role: "user", content: text });
+	// Pi exposes the enabled models as ctx.scopedModels; a context with neither that nor
+	// getScopedModels must fall back to the enabledModels patterns in settings.
+	{
+		const bare = {
+			cwd: root,
+			isProjectTrusted: () => false,
+			modelRegistry: routeCtx.modelRegistry,
+		};
+		const started = Date.now();
+		const routed = await definition.route(
+			{ reason: "user", messages: [{ role: "user", content: "rename a variable across 40 files" }], thinkingLevel: "medium" },
+			bare,
+		);
+		console.log(`route bare ctx (settings fallback) -> ${routed.model.provider}/${routed.model.id} @ ${routed.thinkingLevel} (${Date.now() - started}ms)`);
+	}
+
 	if (process.env.SHOW_STATE) {
 		// Print the state the router builds, including the Artificial Analysis block.
 		const seen = [];
