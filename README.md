@@ -198,40 +198,21 @@ Select it once (or set it as `defaultModel`) and every request is routed:
 - `direct` requests (compaction summaries, extension calls) go to `fallback`.
 - If the endpoint is unreachable or the answer is unusable, `fallback` answers.
 
-The candidate table is built from pi's model registry, so it carries real numbers
-rather than names alone:
-
-```
-[1] anthropic/claude-sonnet-5-5
-    price: $3.00/M input, $15.00/M output
-    limits: 200k context, 64k max output
-    thinking: low, medium, high, xhigh
-    notes: good all-rounder for everyday coding work
-```
-
-On top of that, `data/aa-intelligence.json` carries Artificial Analysis figures per
-model *and reasoning effort*, because the site treats those as separate entities: Opus
-5.5 at medium is index 51 for $1.34 a task, Sonnet 5.5 at high is 47 for $1.08. The
-router passes that table through as it stands.
+`data/aa-intelligence.json` carries Artificial Analysis figures per model *and
+reasoning effort*, because the site treats those as separate entities: Opus 5.5 at
+medium is index 51 for $1.34 a task, Opus 5.5 at low is 42 for $0.55, and Sonnet 5.5 at
+high is 47 for $1.08. Two numbers per row, capability and cost, and they are the whole
+decision.
 
 ```
 [0] claude-bridge/claude-opus-5-5
-    price: $4.00/M input, $20.00/M output
-    limits: 200k context, 64k max output
-    thinking: low, medium, high, xhigh
-    Artificial Analysis, by reasoning effort:
-       low      index 42, $0.55/task, 71.8 tok/s
-       medium   index 51, $1.34/task, 71.2 tok/s
-       high     index 54, $1.82/task, 72.5 tok/s
-       xhigh    index 56, $3.46/task, 77.6 tok/s
-     * max      index 58, $5.98/task, 89.8 tok/s
-       (* a setting pi cannot select for this model)
+    Artificial Analysis Intelligence Index and cost per task, by reasoning effort:
+      low      index 42, $0.55/task
+      medium   index 51, $1.34/task
+      high     index 54, $1.82/task
+      xhigh    index 56, $3.46/task
+      max      index 58, $5.98/task
 ```
-
-A row marked `*` describes a setting pi would never send, which is worth seeing rather
-than hiding: Claude Sonnet 5 has exactly one Artificial Analysis row, its own
-maximum-effort default at index 38, and pi would run it at low, medium or high. That
-is the weakest row in the table, so do not read it as "Sonnet 5 at medium scores 38".
 
 `notes` in `profiles` is still there for anything the numbers do not say, and is passed
 through verbatim.
@@ -249,22 +230,25 @@ comes back as `index not measured` (Sonnet 5.5 at low, as of 2026-10-01).
 
 The questions are:
 
+- **depth**, one score over the levels `jev/auto` advertises (`off` through `max`), so
+  the answer is a level pi can send. Each model's own levels narrow it, and a model that
+  cannot think gets `off`. With Artificial Analysis data present the instructions also ask
+  it to weigh what each step up costs, since the table shows where a step is not worth
+  its price.
 - **fit**, one score per candidate: "How well should this model handle this task,
-  weighing what it costs? The cheapest model that handles it well belongs at the top; a
-  cheap model that only scrapes by does not, however cheap it is." Levels are `cannot`,
-  `poorly`, `adequately`, `well`, `expertly`.
-- **depth**, one score over the levels `jev/auto` advertises, so the answer is a level
-  pi can send. The winner's own levels narrow it further, and a model that cannot think
-  gets `off`. With Artificial Analysis data present the instructions also ask it to weigh
-  what each step up costs, since the table shows where a step is not worth its price.
+  weighing what it costs? Judge it against what the task needs, not against the model's
+  reputation." Levels are `cannot`, `poorly`, `adequately`, `well`, `expertly`.
 
-The highest fit wins. Models within `tieMargin` (0.25) of it count as tied and the
-cheapest of those takes it, which is where the cost preference actually lands: the
-router spends the strongest model only when a weaker one is clearly out of its depth.
+Depth is decided first, because what a task costs depends on the effort it runs at.
+Then the highest fit wins, and models within `tieMargin` (0.5, half a level) of it count
+as tied: the cheapest of those takes it, priced at the effort each would run at. That is
+where the cost preference lands, and it is what sends low-intelligence work to cheap
+models. A model Artificial Analysis has not measured falls back to its catalog price, so
+a free local model still wins what it can do.
 
 Settings: `fallback` (a `provider/id`), `candidates` (defaults to your enabled models),
 `profiles`, `thinkingLevels`, `maxCandidates`, `taskChars`, `tieMargin`. Each routing
-decision is one request, 400-600ms locally.
+decision is one request, 450-550ms locally.
 
 ```json
 "jev-model-router": {
@@ -277,13 +261,20 @@ decision is one request, 400-600ms locally.
 }
 ```
 
-With no benchmark data at all, opus and sonnet landed 0.06 apart on every task, which
-is inside the noise, and the router always bought the cheaper one. With the Artificial
-Analysis table in the state, the same two prompts route differently: a mechanical
-rename goes to `claude-sonnet-5` at low, a distributed-lock design goes to
-`claude-opus-5-5`. Free-text notes swing hard in the other direction, so prefer the
-numbers: "struggles with multi-step reasoning" dropped one model from 2.88 to 1.42 on a
-rename that was never multi-step.
+With no benchmark data at all, opus and sonnet landed 0.06 apart on every task, which is
+inside the noise, and the router always bought the same one. With the table in the state
+and ties going to the cheaper option, four candidates route like this:
+
+| prompt | fits (opus, sonnet, haiku, space-bunny) | routed |
+|---|---|---|
+| rename a variable across 40 files | 2.94, 2.74, 1.50, 0.13 | opus 5.5 at low, $0.55/task |
+| what is the capital of France? | 2.84, 1.82, 3.24, 3.02 | space-bunny at off, free |
+| design a distributed lock protocol | opus well ahead | opus 5.5 |
+
+The second row is the point of the cost column: haiku and the free model lead on a
+factual question, and neither is in contention on the refactor. Free-text notes swing
+hard in the other direction, so prefer the numbers: "struggles with multi-step
+reasoning" dropped one model from 2.88 to 1.42 on a rename that was never multi-step.
 
 ## Question types
 

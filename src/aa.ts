@@ -89,36 +89,34 @@ function versionTokens(name: string): string[] {
 }
 
 /**
- * The per-effort lines for a candidate, or undefined when nothing matched.
- *
- * `levels` is what pi can actually send. A row whose effort pi cannot select is
- * marked with `*`, since it describes a setting the router would never choose:
- * Claude Sonnet 5 has one Artificial Analysis row, its own maximum-effort default,
- * and pi would run it at low, medium or high.
+ * The per-effort lines for a candidate, or undefined when nothing matched. Only the
+ * two headline measures: capability on the Artificial Analysis Intelligence Index, and
+ * what one task costs at that effort. Speed is in the data file and left out here.
  */
-export function effortLines(model: { id: string; name?: string }, levels?: readonly string[]): string[] | undefined {
+export function effortLines(model: { id: string; name?: string }): string[] | undefined {
 	const rows = rowsFor(model);
 	if (!rows.length) return undefined;
-	const lines = rows.map((row) => {
-		const effort = effortOf(row);
-		const parts = [
-			row.index !== undefined ? `index ${row.index}` : "index not measured",
-			row.costPerTaskUsd !== undefined ? `$${row.costPerTaskUsd.toFixed(2)}/task` : "cost not measured",
-			row.outputTokensPerSecond !== undefined ? `${row.outputTokensPerSecond} tok/s` : undefined,
-		].filter(Boolean);
-		const mark = levels && !levels.includes(effort) ? "*" : " ";
-		return `     ${mark} ${effort.padEnd(8)} ${parts.join(", ")}`;
+	return rows.map((row) => {
+		const index = row.index !== undefined ? `index ${row.index}` : "index not measured";
+		const cost = row.costPerTaskUsd !== undefined ? `$${row.costPerTaskUsd.toFixed(2)}/task` : "cost not measured";
+		return `      ${effortOf(row).padEnd(8)} ${index}, ${cost}`;
 	});
-	if (lines.some((line) => line.startsWith("     *"))) {
-		lines.push("       (* a setting pi cannot select for this model)");
-	}
-	return lines;
 }
 
-/** The best index any effort of this model reached, for a one-line summary. */
-export function bestIndex(model: { id: string; name?: string }): number | undefined {
-	const indexes = rowsFor(model)
-		.map((row) => row.index)
-		.filter((value): value is number => value !== undefined);
-	return indexes.length ? Math.max(...indexes) : undefined;
+/**
+ * What one task costs this model at a given effort, or undefined when that effort was
+ * never measured. `lowestMeasured` falls back to the cheapest row the site does have,
+ * which is what a model with a single expensive row should be charged.
+ */
+export function costAtLevel(
+	model: { id: string; name?: string },
+	level: string,
+	lowestMeasured = false,
+): number | undefined {
+	const rows = rowsFor(model);
+	const exact = rows.find((row) => effortOf(row) === level)?.costPerTaskUsd;
+	if (exact !== undefined) return exact;
+	if (!lowestMeasured) return undefined;
+	const costs = rows.map((row) => row.costPerTaskUsd).filter((value): value is number => value !== undefined);
+	return costs.length ? Math.min(...costs) : undefined;
 }

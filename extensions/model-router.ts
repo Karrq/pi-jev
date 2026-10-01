@@ -7,13 +7,16 @@
  * a thinking level. Because the choice happens inside a virtual model, subagents and
  * any allowlist that names models work unchanged: they just see `jev/auto`.
  *
- * What Jev is told about each candidate comes from pi's model registry: price per
- * million tokens in and out, context window, and which thinking levels that model
- * accepts. On top of that, data/aa-intelligence.json carries Artificial Analysis
- * figures per model *and reasoning effort*, so Jev sees that Opus at medium scores 51
- * for $1.34 a task while Sonnet at high scores 47 for $1.08, and can weigh the pair
- * rather than the name. Anything else you know about a model goes in `profiles` as a
- * free-text note.
+ * What Jev is told about each candidate is Artificial Analysis: capability on the
+ * Intelligence Index and cost per task, per model *and reasoning effort*, since the
+ * site reports those as separate entities. So Jev sees that Opus 5.5 at medium scores 51
+ * for $1.34 a task, that Opus at low scores 42 for $0.55, and that Sonnet 5.5 at high
+ * scores 47 for $1.08, and can weigh the pair rather than the name. Anything else you
+ * know about a model goes in `profiles` as a free-text note.
+ *
+ * Those two numbers are the whole decision. A cheap model that cannot do the task
+ * scores low and loses; a cheap model that can do it scores high and wins the tie,
+ * since ties go to the cheapest measured configuration.
  *
  * The questions:
  * - One score per candidate: how well should this model handle the task, weighing
@@ -37,7 +40,7 @@
 
 import type { Message, Model } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext, ModelRoute, ModelRouteRequest } from "@earendil-works/pi-coding-agent";
-import { bestIndex, effortLines } from "../src/aa.ts";
+import { costAtLevel, effortLines } from "../src/aa.ts";
 import { resolve } from "../src/config.ts";
 import { systemOne } from "../src/client.ts";
 import { listOption, numberOption, objectOption, stringOption } from "../src/shared.ts";
@@ -47,7 +50,7 @@ const EXTENSION = "jev-model-router";
 const VIRTUAL_PROVIDER = "jev";
 const VIRTUAL_ID = "auto";
 
-const DEFAULT_LEVELS = ["off", "low", "medium", "high", "xhigh"];
+const DEFAULT_LEVELS = ["off", "low", "medium", "high", "xhigh", "max"];
 const ALL_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 type Level = (typeof ALL_LEVELS)[number];
 
@@ -73,10 +76,6 @@ function lastUserText(messages: readonly Message[]): string {
 	return content.flatMap((block) => (block.type === "text" ? [block.text] : [])).join("\n");
 }
 
-function money(value: number): string {
-	return `$${value.toFixed(2)}`;
-}
-
 /** Levels this model accepts, from its thinking level map, narrowed to `advertised`. */
 function levelsOf(model: Model<any>, advertised: readonly Level[]): Level[] {
 	if (!model.reasoning) return ["off"];
@@ -87,15 +86,10 @@ function levelsOf(model: Model<any>, advertised: readonly Level[]): Level[] {
 }
 
 function describe(candidate: Candidate, index: number): string {
-	const lines = [
-		`[${index}] ${candidate.label}`,
-		`    price: ${money(candidate.input)}/M input, ${money(candidate.output)}/M output`,
-		`    limits: ${Math.round(candidate.model.contextWindow / 1000)}k context, ${Math.round(candidate.model.maxTokens / 1000)}k max output`,
-		`    thinking: ${candidate.levels.join(", ")}`,
-	];
-	const efforts = effortLines(candidate.model, candidate.levels);
+	const lines = [`[${index}] ${candidate.label}`];
+	const efforts = effortLines(candidate.model);
 	if (efforts) {
-		lines.push(`    Artificial Analysis, by reasoning effort:`);
+		lines.push("    Artificial Analysis Intelligence Index and cost per task, by reasoning effort:");
 		lines.push(...efforts);
 	}
 	if (candidate.note) lines.push(`    notes: ${candidate.note}`);
@@ -149,7 +143,7 @@ export default function (pi: ExtensionAPI) {
 			const profiles = objectOption(options, "profiles", {}) as Record<string, string>;
 			const maxCandidates = numberOption(options, "maxCandidates", 24);
 			const taskChars = numberOption(options, "taskChars", 16_000);
-			const tieMargin = numberOption(options, "tieMargin", 0.25);
+			const tieMargin = numberOption(options, "tieMargin", 0.5);
 
 			const scoped = (ctx.getScopedModels?.() ?? []).map((entry: any) => entry.model ?? entry);
 			const enabled = [
@@ -195,12 +189,10 @@ export default function (pi: ExtensionAPI) {
 				const { endpoint } = resolve(ctx.cwd ?? process.cwd(), EXTENSION, ctx.isProjectTrusted());
 				const questions: Record<string, any> = {};
 				for (const [index, candidate] of candidates.entries()) {
-					const ceiling = bestIndex(candidate.model);
 					questions[`fit_${index}`] = {
 						type: "score",
 						instructions:
-							`How well should ${candidate.label} handle this task, weighing what it costs? The cheapest model that handles it well belongs at the top; a cheap model that only scrapes by does not, however cheap it is.` +
-							(ceiling !== undefined ? ` Its best measured capability is ${ceiling} on the Artificial Analysis Intelligence Index.` : ""),
+							`How well should ${candidate.label} handle this task, weighing what it costs? Judge it against what the task needs, not against the model's reputation. The cheapest model that handles it well belongs at the top; a cheap model that only scrapes by does not, however cheap it is.`,
 						criteria: FIT_LEVELS,
 					};
 				}
@@ -214,23 +206,30 @@ export default function (pi: ExtensionAPI) {
 
 				const result = await systemOne(endpoint, state, questions, { signal: request.signal });
 
-				// Highest fit wins; models within tieMargin of it are treated as tied and
-				// the cheaper of those takes it.
+				// Depth first: the effort decides what a task costs, so the cost comparison
+				// has to happen at the effort that will actually be used.
+				const depth = result.answers.depth;
+				const requested = depth?.type === "score" ? levelLabel(depth) : "off";
+
+				// Highest fit wins; models within tieMargin of it are treated as tied and the
+				// cheapest of those takes it. Cost is what a task costs at the effort each
+				// model would run at, which is what lets a cheap model win a task that does
+				// not need a strong one.
 				const scored = candidates
 					.map((candidate, index) => {
 						const answer = result.answers[`fit_${index}`];
-						return { candidate, fit: answer?.type === "score" ? answer.score : -1 };
+						const level = nearestLevel(requested, candidate.levels);
+						// Measured cost at that effort, else the cheapest row the site has, else
+						// the catalog price for a model it knows nothing about.
+						const cost = costAtLevel(candidate.model, level, true) ?? candidate.blended;
+						return { candidate, level, cost, fit: answer?.type === "score" ? answer.score : -1 };
 					})
 					.filter((entry) => entry.fit >= 0);
 				if (scored.length === 0) return { model: fallback, thinkingLevel: request.thinkingLevel };
 				const best = Math.max(...scored.map((entry) => entry.fit));
 				const contenders = scored.filter((entry) => entry.fit >= best - tieMargin);
-				const chosen = contenders.reduce((a, b) => (b.candidate.blended < a.candidate.blended ? b : a));
-
-				const depth = result.answers.depth;
-				const requested = depth?.type === "score" ? String(levelLabel(depth)) : "off";
-				const thinkingLevel = nearestLevel(requested, chosen.candidate.levels);
-				return { model: chosen.candidate.model, thinkingLevel };
+				const chosen = contenders.reduce((a, b) => (b.cost < a.cost ? b : a));
+				return { model: chosen.candidate.model, thinkingLevel: chosen.level };
 			} catch {
 				return { model: fallback, thinkingLevel: request.thinkingLevel };
 			}

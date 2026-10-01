@@ -241,6 +241,7 @@ if (process.argv.includes("--route")) {
 	const catalog = [
 		{ model: model("claude-bridge", "claude-opus-5-5", "Claude Opus 5.5", 4, { reasoning: true, thinkingLevelMap: { off: null, low: "low", medium: "medium", high: "high", xhigh: "max" } }) },
 		{ model: model("claude-bridge", "claude-sonnet-5", "Claude Sonnet 5", 2, { reasoning: true, thinkingLevelMap: { off: null, low: "low", medium: "medium", high: "high", xhigh: "max" } }) },
+		{ model: model("claude-bridge", "claude-haiku-4-5", "Claude Haiku 4.5", 1, { reasoning: false }) },
 		{ model: model("openrouter", "space-bunny-alpha", "Space Bunny Alpha", 0, { reasoning: false }) },
 	];
 	const routeCtx = {
@@ -257,15 +258,30 @@ if (process.argv.includes("--route")) {
 		const seen = [];
 		const originalFetch = globalThis.fetch;
 		globalThis.fetch = async (url, init) => {
-			seen.push(JSON.parse(init.body).state);
-			return originalFetch(url, init);
+			const body = JSON.parse(init.body);
+			seen.push(body.state);
+			console.log(`   task: ${body.state.split("\n")[1]}`);
+			const response = await originalFetch(url, init);
+			const answers = (await response.clone().json()).answers;
+			for (const [id, answer] of Object.entries(answers)) {
+				if (id === "depth") continue;
+				const top = Object.entries(answer.probabilities ?? {}).sort((a, b) => b[1] - a[1])[0];
+				console.log(`   ${id.padEnd(7)} mean ${answer.score.toFixed(2)}  top ${top[0]} ${(top[1] * 100).toFixed(0)}%`);
+			}
+			const depth = answers.depth;
+			const topLevel = Object.entries(depth.probabilities ?? {}).sort((a, b) => b[1] - a[1])[0];
+			console.log(`   depth   top ${topLevel[0]} ${(topLevel[1] * 100).toFixed(0)}%`);
+			return response;
 		};
-		await definition.route({ reason: "user", messages: [message("rename a variable across 40 files")], thinkingLevel: "medium" }, routeCtx);
+		for (const task of ["rename a variable across 40 files", "what is the capital of France?"]) {
+			await definition.route({ reason: "user", messages: [message(task)], thinkingLevel: "medium" }, routeCtx);
+		}
 		globalThis.fetch = originalFetch;
 		console.log(seen.at(-1));
 	}
 	for (const [label, request] of [
 		["user, simple task", { reason: "user", messages: [message("rename a variable across 40 files")], thinkingLevel: "medium" }],
+		["user, trivial task", { reason: "user", messages: [message("what is the capital of France?")], thinkingLevel: "medium" }],
 		["user, hard task", { reason: "user", messages: [message("design a distributed lock protocol and prove it correct under partitions")], thinkingLevel: "medium" }],
 		["continuation", { reason: "continuation", messages: [], previous: { model: catalog[1].model, thinkingLevel: "high" }, thinkingLevel: "medium" }],
 		["direct", { reason: "direct", messages: [], thinkingLevel: "medium" }],
