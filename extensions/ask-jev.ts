@@ -1,23 +1,21 @@
 /**
  * ask-jev: typed questions about any text, without putting that text in context.
  *
- * The state can be inline (`state`), files (`paths`, globs allowed), or the output
- * of shell commands (`commands`). Files and commands are read or run here, sent to
- * the endpoint, and only the answers plus a short per-source summary come back.
- * That is the saving: 40k tokens of command output can be reasoned about without
- * the model ever reading them.
+ * The state is inline text (`state`), the output of shell commands (`commands`), or
+ * both. Commands are run here, sent to the endpoint, and only the answers come back,
+ * so 40k tokens of output can be reasoned about without the model ever reading them.
+ * For files use the jev_file tool, which reads and chunks them.
  *
  * One request covers every source. With `perSource: true` each source is asked
  * separately, which costs one request per source but reports which file or command
  * each answer came from.
  *
- * Command output is also written to a temp file (the same place pi puts truncated
- * bash output) and the path is reported, so the exact failing lines are one `read`
- * away instead of a second request.
+ * Every command's full output is written to a temp file (the same place pi puts
+ * truncated bash output) and the path is listed with the source, so the exact
+ * failing lines are one `read` away instead of a second request.
  *
  * Settings: overrides["ask-jev"] = {
- *   maxQuestions, maxSources, maxFileBytes, maxCommandBytes, commandTimeoutMs,
- *   maxHeadChars, model }
+ *   maxQuestions, maxCommandBytes, commandTimeoutMs, maxHeadChars, model }
  *
  * Toggle: "+extensions/ask-jev.ts" in the package's extension list.
  */
@@ -32,7 +30,7 @@ import { resolve } from "../src/config.ts";
 import { systemOne } from "../src/client.ts";
 import { formatAnswer, type JevAnswer, type JevQuestion, type QuestionType } from "../src/types.ts";
 import { endpointLine, failure, numberOption, text } from "../src/shared.ts";
-import { readPathPatterns, renderBlocks, runCommand, type SourceBlock } from "../src/sources.ts";
+import { renderBlocks, runCommand, type SourceBlock } from "../src/sources.ts";
 
 const EXTENSION = "ask-jev";
 
@@ -54,11 +52,6 @@ const QuestionSpec = Type.Object({
 const AskParams = Type.Object({
 	questions: Type.Array(QuestionSpec, { minItems: 1, description: "Typed questions to answer" }),
 	state: Type.Optional(Type.String({ description: "Inline text to answer about" })),
-	paths: Type.Optional(
-		Type.Array(Type.String(), {
-			description: "Files or globs to read (relative to the working directory). Their text is sent, not shown to you.",
-		}),
-	),
 	commands: Type.Optional(
 		Type.Array(Type.String(), {
 			description: "Shell commands to run. Their combined output is sent, not shown to you.",
@@ -68,12 +61,6 @@ const AskParams = Type.Object({
 		Type.Boolean({ description: "Ask each source separately so every answer names its source (one request per source)" }),
 	),
 	model: Type.Optional(Type.String({ description: "Override the model for this call" })),
-	saveOutput: Type.Optional(
-		Type.Boolean({
-			description:
-				"Write each command's full output to a temp file and report the path, so you can read the exact lines later instead of asking again. Default true.",
-		}),
-	),
 	headChars: Type.Optional(
 		Type.Number({
 			description:
@@ -135,12 +122,9 @@ export default function (pi: ExtensionAPI) {
 		async execute(_id, params, signal, _onUpdate, ctx) {
 			const { endpoint, options } = resolve(ctx.cwd, EXTENSION, ctx.isProjectTrusted());
 			const maxQuestions = numberOption(options, "maxQuestions", 32);
-			const maxSources = numberOption(options, "maxSources", 24);
-			const maxFileBytes = numberOption(options, "maxFileBytes", 2 << 20);
 			const maxCommandBytes = numberOption(options, "maxCommandBytes", 400_000);
 			const commandTimeoutMs = numberOption(options, "commandTimeoutMs", 30_000);
 			const headChars = params.headChars ?? numberOption(options, "maxHeadChars", 300);
-			const saveOutput = params.saveOutput ?? options.saveOutput !== false;
 
 			try {
 				const questions = buildQuestions(params.questions as Spec[], maxQuestions);
@@ -149,12 +133,6 @@ export default function (pi: ExtensionAPI) {
 
 				if (params.state?.trim()) {
 					blocks.push({ label: "inline state", origin: "inline", text: params.state, originalBytes: Buffer.byteLength(params.state), truncated: false });
-				}
-				if (params.paths?.length) {
-					const files = await readPathPatterns(params.paths, { cwd: ctx.cwd, maxFileBytes, maxFiles: maxSources });
-					blocks.push(...files.blocks);
-					if (files.missing.length) notes.push(`no match: ${[...new Set(files.missing)].join(", ")}`);
-					for (const skip of files.skipped) notes.push(`skipped ${skip.origin} (${skip.reason})`);
 				}
 				for (const command of params.commands ?? []) {
 					const result = await runCommand(command, { cwd: ctx.cwd, timeoutMs: commandTimeoutMs, maxBytes: maxCommandBytes, signal });
@@ -165,21 +143,14 @@ export default function (pi: ExtensionAPI) {
 						originalBytes: result.originalBytes,
 						truncated: result.truncated,
 					};
-					if (saveOutput) {
-						const path = join(tmpdir(), `pi-ask-jev-${randomUUID().slice(0, 8)}.log`);
-						await mkdir(tmpdir(), { recursive: true });
-						await writeFile(path, result.text, "utf8");
-						block.savedOutput = path;
-					}
+					const path = join(tmpdir(), `pi-ask-jev-${randomUUID().slice(0, 8)}.log`);
+					await writeFile(path, result.text, "utf8");
+					block.savedOutput = path;
 					blocks.push(block);
 					if (result.timedOut) notes.push(`${command}: timed out after ${commandTimeoutMs}ms`);
 					else if (result.exitCode !== 0) notes.push(`${command}: exit ${result.exitCode}`);
 				}
-				if (blocks.length === 0) throw new Error("nothing to ask about: pass state, paths or commands");
-				if (blocks.length > maxSources) {
-					notes.push(`only the first ${maxSources} sources were sent`);
-					blocks.length = maxSources;
-				}
+				if (blocks.length === 0) throw new Error("nothing to ask about: pass state or commands");
 
 				const labelled = blocks.map(blockFor);
 				const model = params.model ?? (typeof options.model === "string" ? options.model : undefined);
@@ -217,18 +188,33 @@ export default function (pi: ExtensionAPI) {
 
 				const elapsedMs = Date.now() - started;
 				const totalBytes = blocks.reduce((sum, block) => sum + block.originalBytes, 0);
-				const lines = Object.entries(answers).map(([id, answer]) => {
-					const from = sources[id]?.[0];
-					return `${id}: ${formatAnswer(answer)}${from ? ` [${from}]` : ""}`;
-				});
-				const sourceLines = labelled.map((block, index) => {
-					const saved = block.savedOutput ? ` saved: ${block.savedOutput}` : "";
-					return `source ${index}: ${block.label} (${block.originalBytes} bytes${block.truncated ? ", truncated" : ""})${saved}`;
-				});
 				const header = `[ask_jev ${endpointName} ${elapsedMs}ms, ${blocks.length} source(s), ${totalBytes} bytes, ${usage.input_tokens ?? "?"} input tokens]`;
+				const sourceLine = (label: string) => {
+					const block = labelled.find((entry) => entry.label === label);
+					const bytes = `(${block?.originalBytes ?? 0} bytes${block?.truncated ? ", truncated" : ""})`;
+					return `source ${label} ${bytes}${block?.savedOutput ? ` ${block.savedOutput}` : ""}`;
+				};
+				const answerLine = (id: string) => `${id}: ${formatAnswer(answers[id])}`;
+				const answerIds = Object.keys(answers);
+
+				let body: string[];
+				if (params.perSource && labelled.length > 1) {
+					// Each source was asked on its own, so group the answers under the
+					// source that produced them.
+					const groups = new Map<string, string[]>();
+					for (const id of answerIds) {
+						const label = sources[id]?.[0];
+						if (!label) continue;
+						if (!groups.has(label)) groups.set(label, []);
+						groups.get(label)!.push(answerLine(id));
+					}
+					body = [...groups.entries()].flatMap(([label, lines]) => [sourceLine(label), ...lines, ""]);
+				} else {
+					body = [labelled.map((block) => sourceLine(block.label)).join("\n"), "", ...answerIds.map(answerLine)];
+				}
 
 				return {
-					...text([header, "", ...lines, "", ...sourceLines, ...(notes.length ? ["", ...notes] : [])].join("\n")),
+					...text([header, "", ...body, ...(notes.length ? ["", ...notes] : [])].join("\n")),
 					details: {
 						answers,
 						sources,

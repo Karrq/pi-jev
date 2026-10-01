@@ -123,7 +123,7 @@ if (process.argv.includes("--tools")) {
 				{ id: "has_gate", instructions: "Does the bash gate refuse commands outright above some probability of high risk?" },
 				{ id: "who_blocks", type: "choice", instructions: "What happens to a command in the top risk band?", criteria: ["refused: it is blocked with the reason", "asked: a dialog asks you", "allowed: it runs with a warning"] },
 			],
-			paths: ["extensions/bash-gate.ts", "extensions/ask-jev.ts"],
+			commands: ["cat extensions/bash-gate.ts | head -60", "cat extensions/ask-jev.ts | head -40"],
 			perSource: true,
 		},
 		ask_jev_sources: {

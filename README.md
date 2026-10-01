@@ -79,27 +79,36 @@ With no `pi-jev` key, everything uses `http://127.0.0.1:10610`.
 
 ### `ask_jev`
 
-```json
-{
-  "questions": [{ "instructions": "Are any tests failing?", "id": "failing" }],
-  "commands": ["npm test 2>&1 | tail -40"],
-  "paths": ["src/**/*.ts"],
-  "state": "optional inline text",
-  "perSource": false,
-  "saveOutput": true,
-  "model": "optional override",
-  "headChars": 300
-}
+| Parameter | Meaning |
+|---|---|
+| `questions` | Required. Each is `{id?, instructions, type?, criteria?}`, `type` being `noul` (yes/no, the default), `choice` or `score`. `id` defaults to `q1`, `q2`. |
+| `commands` | Shell commands to run. Their output goes to the endpoint, never to the conversation. |
+| `state` | Inline text to answer about, if you do not need to run anything. |
+| `perSource` | Ask each source separately. One request per source, and every answer then names the source it came from. Off by default, which is one request for everything. |
+| `model` | Override the model for this call. |
+| `headChars` | Characters to quote from each contributing source, so you can see what was read without reading it all. 0 for none. Default 300. |
+
+Every command's full output is written to `tmpdir()/pi-ask-jev-<id>.log` and listed
+with its source, so the exact failing lines are one `read` away instead of a second
+request.
+
+```
+source 0: $ npm test 2>&1 | tail -40 (1832 bytes) /tmp/pi-ask-jev-cff636f2.log
+source 1: $ npm run typecheck (0 bytes) /tmp/pi-ask-jev-5e286711.log
+
+failing: true (true 100.0%, false 0.0%)
+count: some (some 100.0%, none 0.0%, many 0.0%)
 ```
 
-Sources are read or run here and sent to the endpoint; only the answers return, so
-the command output never enters the conversation. `paths` accepts files and globs.
-`perSource: true` asks each source separately, which costs one request per source
-but reports which file or command each answer came from. `headChars` quotes the
-start of each contributing source; the model does not report offsets, so this is
-the head of the file or output, not the matching region. `saveOutput` writes each
-command's full output to `tmpdir()/pi-ask-jev-<id>.log` and reports the path, so the
-model can `read` the exact failing lines instead of asking again.
+With `perSource: true` each answer sits under the source that produced it:
+
+```
+source 0: $ cat extensions/bash-gate.ts | head -60 (2703 bytes) /tmp/pi-ask-jev-9bae38ac.log
+has_gate: true (true 100.0%, false 0.0%)
+who_blocks: refused (refused 100.0%, asked 0.0%, allowed 0.0%)
+```
+
+Files are not a parameter here: use `jev_file`, which reads and chunks them.
 
 ### `jev_drop`
 
@@ -129,17 +138,17 @@ to memory. With no argument it prints usage and the current thresholds.
     { "id": "expiry", "instructions": "Does this return 401 for an expired token?" },
     { "id": "attempts", "type": "choice", "instructions": "What controls the retries?",
       "criteria": ["attempts_arg: the parameter", "retry_env: an environment variable"] }
-  ],
-  "chunkChars": 16000,
-  "maxChunks": 8,
-  "maxFiles": 20
+  ]
 }
 ```
 
-Files over `chunkChars` are split with 1k overlap and asked per chunk; the most
-confident chunk wins per question. Every answer names its file and character range,
-and `details.resolvedPaths` lists the absolute paths that matched. Chunks run one at
-a time by default, because a local server serializes requests; raise `concurrency`
+Two parameters only: `paths` and `questions`. Chunking is not the model's decision.
+Files over `chunkChars` (16k characters, about 4k tokens) are split with 1k overlap
+and asked per chunk; the most confident chunk wins per question. Every answer names
+its file and character range, and `details.resolvedPaths` lists the absolute paths
+that matched. `chunkChars`, `overlapChars`, `maxChunks`, `maxFiles`, `maxFileBytes`,
+`maxQuestions` and `concurrency` live in `overrides["jev-file-relevance"]`. Chunks
+run one at a time because a local server serializes requests; raise `concurrency`
 for a hosted endpoint.
 
 ### The bash gate (hook, no tool)
@@ -159,11 +168,19 @@ against 3.0 never fires.
 | `rm -rf ~` | 1.00 | 1.00 | 0.99 | refused |
 | `git push --force origin main` | 1.00 | 1.00 | 1.00 | refused |
 
-Bands: refused when the top level wins or `P(high) >= blockAt` (0.5); silent when the
-level is none/low and `P(medium)+P(high) < askAt` (0.25); asked in between. A
-non-read-only command with confidence below `minConfidence` (0.6) is asked whatever
-the level says. With no interactive terminal the ask band follows `nonInteractive`:
-run with a warning (default) or refuse.
+What the knobs mean, all under `overrides["jev-bash-gate"]`:
+
+| Setting | Default | Effect |
+|---|---|---|
+| `askAt` | 0.25 | Silent while `P(medium)+P(high)` is below this; above it the command is worth a question. |
+| `blockAt` | 0.5 | Refused at `P(high)` at or above this, or whenever the top level wins outright. |
+| `minConfidence` | 0.6 | Below this, a command that is not read-only is asked whatever the level says. |
+| `nonInteractive` | `"run"` | What "asked" means when there is no terminal to ask in (RPC, print): run it with a warning, or refuse it. |
+| `allow` | `[]` | Command prefixes to skip entirely, everywhere. |
+| `timeoutMs` | endpoint's | Per-request timeout override. |
+
+There is no `mode: notify` any more; that was the old three-mode design and it is
+replaced by the bands above plus `nonInteractive`.
 
 Allowlists skip the request entirely: `allow` in settings applies everywhere,
 `/jev-allow <prefix>` adds a prefix for the current session only (recorded on the

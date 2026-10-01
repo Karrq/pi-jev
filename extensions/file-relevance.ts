@@ -37,9 +37,6 @@ const FileParams = Type.Object({
 		}),
 		{ minItems: 1, description: "Typed questions to answer about the files" },
 	),
-	chunkChars: Type.Optional(Type.Number({ description: "Characters per chunk when a file is large (default 16000, about 4k tokens)" })),
-	maxChunks: Type.Optional(Type.Number({ description: "Stop after this many chunks per file (default 8)" })),
-	maxFiles: Type.Optional(Type.Number({ description: "Stop after this many files (default 20)" })),
 });
 
 interface Spec {
@@ -130,10 +127,12 @@ export default function (pi: ExtensionAPI) {
 
 		async execute(_id, params, signal, onUpdate, ctx) {
 			const { endpoint, options } = resolve(ctx.cwd, EXTENSION, ctx.isProjectTrusted());
-			const chunkChars = params.chunkChars ?? numberOption(options, "chunkChars", 16_000);
+			// Chunking is an implementation detail, not a decision for the model:
+			// these come from settings only.
+			const chunkChars = numberOption(options, "chunkChars", 16_000);
 			const overlapChars = numberOption(options, "overlapChars", 1_000);
-			const maxChunks = params.maxChunks ?? numberOption(options, "maxChunks", 8);
-			const maxFiles = params.maxFiles ?? numberOption(options, "maxFiles", 20);
+			const maxChunks = numberOption(options, "maxChunks", 8);
+			const maxFiles = numberOption(options, "maxFiles", 20);
 			const maxFileBytes = numberOption(options, "maxFileBytes", 2 << 20);
 			const concurrency = numberOption(options, "concurrency", 1);
 			const maxQuestions = numberOption(options, "maxQuestions", 12);
