@@ -134,6 +134,11 @@ export default function (pi: ExtensionAPI) {
 		id: VIRTUAL_ID,
 		name: "Auto (Jev)",
 		thinkingLevels: DEFAULT_LEVELS,
+		// Only shown until the first response, after which pi uses the physical model's own
+		// limits. These are the smallest among the candidates rather than a claim about any
+		// one model, since the model is not known until it is routed.
+		contextWindow: 200_000,
+		maxTokens: 64_000,
 		async route(request: ModelRouteRequest, ctx: ExtensionContext): Promise<ModelRoute> {
 			// Options can only be read from a context, and route() does not get one
 			// until a session starts, so read them through the model registry's ctx.
