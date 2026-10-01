@@ -95,7 +95,7 @@ if (process.argv.includes("--tools")) {
 	writeFileSync(join(sample, "auth.ts"), "export function login(token: string) {\n  if (isExpired(token)) return 401;\n  return 200;\n}\n");
 	const cases = {
 		ask_jev: {
-			state: "Deploy log: staging healthy, p95 210ms, error rate 0.02%.",
+			commands: ["echo 'Deploy log: staging healthy, p95 210ms, error rate 0.02%.'"],
 			questions: [
 				{ id: "healthy", instructions: "Is the service healthy?" },
 				{ id: "status", type: "score", instructions: "How bad is it?", criteria: ["fine", "degraded", "down"] },

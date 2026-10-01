@@ -122,7 +122,7 @@ export default function (pi: ExtensionAPI) {
 			"Answer typed questions about one or more files (globs allowed) by reading them in chunks: per question the " +
 			"most confident chunk wins, and the answer names the file and character range. Use to check whether files " +
 			"answer a question, or to extract facts from many of them at once, without loading them into context.",
-		promptSnippet: "Answer typed questions about files, chunked, with the source file and range reported",
+		promptSnippet: "Answer typed questions about files without loading them into context",
 		parameters: FileParams,
 
 		async execute(_id, params, signal, onUpdate, ctx) {

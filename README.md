@@ -82,8 +82,7 @@ With no `pi-jev` key, everything uses `http://127.0.0.1:10610`.
 | Parameter | Meaning |
 |---|---|
 | `questions` | Required. Each is `{id?, instructions, type?, criteria?}`, `type` being `noul` (yes/no, the default), `choice` or `score`. `id` defaults to `q1`, `q2`. |
-| `commands` | Shell commands to run. Their output goes to the endpoint, never to the conversation. |
-| `state` | Inline text to answer about, if you do not need to run anything. |
+| `commands` | Shell commands to run. Their combined output goes to the endpoint, never to the conversation. For prose to judge, run `echo "..."`. |
 | `timeout` | Milliseconds to wait for each command before killing it, like the bash tool's `timeout`. Default 30000. |
 | `perSource` | Ask each source separately. One request per source, and every answer then names the source it came from. Off by default, which is one request for everything. |
 
@@ -108,7 +107,7 @@ has_gate: true (true 100.0%, false 0.0%)
 who_blocks: refused (refused 100.0%, asked 0.0%, allowed 0.0%)
 ```
 
-Files are not a parameter here: use `jev_file`, which reads and chunks them.
+Files are not a parameter here: use `jev_file`.
 
 ### `jev_drop`
 
@@ -143,10 +142,10 @@ to memory. With no argument it prints usage and the current thresholds.
 ```
 
 Two parameters only: `paths` and `questions`. Chunking is not the model's decision.
-Files over `chunkChars` (16k characters, about 4k tokens) are split with 1k overlap
-and asked per chunk; the most confident chunk wins per question. Every answer names
-its file and character range, and `details.resolvedPaths` lists the absolute paths
-that matched. `chunkChars`, `overlapChars`, `maxChunks`, `maxFiles`, `maxFileBytes`,
+Files are read internally in pieces (16k characters by default, 1k overlap) because
+accuracy falls off past a few thousand tokens; per question the most confident piece
+wins, and the answer names the file and character range it came from.
+`details.resolvedPaths` lists the absolute paths that matched. `chunkChars`, `overlapChars`, `maxChunks`, `maxFiles`, `maxFileBytes`,
 `maxQuestions` and `concurrency` live in `overrides["jev-file-relevance"]`. Chunks
 run one at a time because a local server serializes requests; raise `concurrency`
 for a hosted endpoint.

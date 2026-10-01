@@ -1,10 +1,10 @@
 /**
  * ask-jev: typed questions about any text, without putting that text in context.
  *
- * The state is inline text (`state`), the output of shell commands (`commands`), or
- * both. Commands are run here, sent to the endpoint, and only the answers come back,
- * so 40k tokens of output can be reasoned about without the model ever reading them.
- * For files use the jev_file tool, which reads and chunks them.
+ * Commands run here, their combined output goes to the endpoint, and only the answers
+ * come back, so 40k tokens of output can be reasoned about without the model ever
+ * reading them. For prose the model wants judged, it can run `echo "..."`, which keeps
+ * one code path for every source.
  *
  * One request covers every source. With `perSource: true` each source is asked
  * separately, which costs one request per source but reports which file or command
@@ -55,7 +55,6 @@ const QuestionSpec = Type.Object({
 
 const AskParams = Type.Object({
 	questions: Type.Array(QuestionSpec, { minItems: 1, description: "Typed questions to answer" }),
-	state: Type.Optional(Type.String({ description: "Inline text to answer about" })),
 	commands: Type.Optional(
 		Type.Array(Type.String(), {
 			description: "Shell commands to run. Their combined output is sent, not shown to you.",
@@ -131,9 +130,6 @@ export default function (pi: ExtensionAPI) {
 				const blocks: SourceBlock[] = [];
 				const notes: string[] = [];
 
-				if (params.state?.trim()) {
-					blocks.push({ label: "inline state", origin: "inline", text: params.state, originalBytes: Buffer.byteLength(params.state), truncated: false });
-				}
 				for (const command of params.commands ?? []) {
 					const result = await runCommand(command, { cwd: ctx.cwd, timeoutMs: commandTimeoutMs, maxBytes: maxCommandBytes, signal });
 					const block: SourceBlock = {
@@ -150,7 +146,7 @@ export default function (pi: ExtensionAPI) {
 					if (result.timedOut) notes.push(`${command}: timed out after ${commandTimeoutMs}ms`);
 					else if (result.exitCode !== 0) notes.push(`${command}: exit ${result.exitCode}`);
 				}
-				if (blocks.length === 0) throw new Error("nothing to ask about: pass state or commands");
+				if (blocks.length === 0) throw new Error("nothing to ask about: pass at least one command");
 
 				const labelled = blocks.map(blockFor);
 				const model = typeof options.model === "string" ? options.model : undefined;
