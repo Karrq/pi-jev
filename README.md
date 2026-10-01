@@ -176,7 +176,7 @@ What the knobs mean, all under `overrides["jev-bash-gate"]`:
 | `blockAt` | 0.5 | Refused at `P(high)` at or above this, or whenever the top level wins outright. |
 | `minConfidence` | 0.6 | Below this, a command that is not read-only is asked whatever the level says. |
 | `nonInteractive` | `"block"` | What "asked" means when there is no terminal to ask in (RPC, print). `block` refuses, because nobody can answer the question; `run` allows it with a warning. |
-| `allow` | `[]` | Command patterns to skip entirely, everywhere. Prefixes without a wildcard, globs with one. |
+| `allow` | `[]` | Command globs to skip entirely, everywhere. |
 | `timeoutMs` | endpoint's | Per-request timeout override. |
 
 There is no `mode: notify` any more; that was the old three-mode design and it is

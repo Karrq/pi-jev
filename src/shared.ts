@@ -9,17 +9,13 @@ import type { ResolvedEndpoint } from "./config.ts";
 /**
  * Whether a command matches any allowlist pattern.
  *
- * A pattern with no wildcard is a prefix, so `npm test` keeps working as it did.
- * A pattern with `*`, `?` or a character class is matched as a glob against the whole
- * command: `git *`, `*rm -rf /*`, `npm run (build|test)`.
+ * Every pattern is a glob matched against the whole command: `*` is any run of
+ * characters, `?` one character, and `[abc]` a class. So `npm test` allows exactly
+ * that command and `npm test*` allows the family.
  */
 export function matchesAny(command: string, patterns: readonly string[]): string | undefined {
 	for (const pattern of patterns) {
 		if (!pattern) continue;
-		if (!/[*?[\]{}]/.test(pattern)) {
-			if (command.startsWith(pattern)) return pattern;
-			continue;
-		}
 		let regex = "";
 		for (const char of pattern) {
 			if (char === "*") regex += ".*";
@@ -30,8 +26,7 @@ export function matchesAny(command: string, patterns: readonly string[]): string
 		try {
 			if (new RegExp(`^${regex}$`).test(command)) return pattern;
 		} catch {
-			// A pattern that is not a valid regex is treated as a literal prefix.
-			if (command.startsWith(pattern)) return pattern;
+			continue;
 		}
 	}
 	return undefined;

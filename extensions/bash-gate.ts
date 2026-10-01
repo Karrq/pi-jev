@@ -35,9 +35,9 @@
  * flagged, including `git push origin main` at safe 0.92 against risk 1.9.
  *
  * Allowlists: `allow` in settings applies everywhere, `/jev-allow <pattern>` adds one
- * for this session only. Patterns without a wildcard are prefixes (`npm test`); with
- * one they are globs against the whole command (`git *`, `*rm -rf /*`). A match skips
- * the request entirely.
+ * for this session only. Patterns are globs matched against the whole command, so
+ * `git *` covers git, `*rm -rf /*` covers rm -rf anywhere, and `npm test` matches that
+ * one command exactly. A match skips the request entirely.
  *
  * Settings: overrides["jev-bash-gate"] = {
  *   askAt, blockAt, minConfidence, nonInteractive, allow, timeoutMs }
@@ -94,7 +94,7 @@ export default function (pi: ExtensionAPI) {
 		return { endpoint, options, bands, allow };
 	}
 
-	/** Prefixes allowed for this session by `/jev-allow`, recorded on the branch. */
+	/** Patterns allowed for this session by `/jev-allow`, recorded on the branch. */
 	function sessionAllow(ctx: ExtensionContext): string[] {
 		const prefixes: string[] = [];
 		for (const entry of ctx.sessionManager.getBranch()) {
@@ -216,7 +216,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("jev-allow", {
-		description: "Let the model run matching commands this session: /jev-allow <pattern>",
+		description: "Let the model run matching commands this session: /jev-allow <glob>",
 		handler: async (args, ctx) => {
 			const pattern = args.trim();
 			if (!pattern) {
@@ -227,7 +227,7 @@ export default function (pi: ExtensionAPI) {
 						"usage: /jev-allow <pattern>",
 						"",
 						"Adds the pattern for this session only, and the gate stops asking about matching commands.",
-						"A pattern with no wildcard is a prefix (npm test); with one it is a glob (git *, *rm -rf /*).",
+						"Patterns are globs over the whole command: `git *`, `*rm -rf /*`, `npm test` for that one command.",
 						`session: ${session.length ? session.join(", ") : "none"}`,
 						`always (settings): ${current.allow.length ? current.allow.join(", ") : "none"}`,
 						"",

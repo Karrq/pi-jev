@@ -266,7 +266,7 @@ if (process.argv.includes("--gate")) {
 	const allowedCtx = (mode) => ({
 		...gateCtx(mode, true),
 		sessionManager: {
-			getBranch: () => [{ type: "custom", customType: "jev-bash-gate.allowed", data: { prefixes: ["grep ", "npm run *", "*rm -rf /tmp/*"] } }],
+			getBranch: () => [{ type: "custom", customType: "jev-bash-gate.allowed", data: { prefixes: ["grep *", "npm run *", "*rm -rf /tmp/*"] } }],
 		},
 	});
 
@@ -283,7 +283,7 @@ if (process.argv.includes("--gate")) {
 	}
 
 	console.log("");
-	for (const command of ["grep -rn TODO src", "npm run build", "npm run typecheck", "rm -rf /tmp/x", "rm -rf node_modules", "rm -rf ~"]) {
+	for (const command of ["grep -rn TODO src", "grep", "npm run build", "npm run typecheck", "rm -rf /tmp/x", "rm -rf node_modules", "rm -rf ~"]) {
 		const started = Date.now();
 		const result = await hook(call(command), allowedCtx("tui"));
 		const outcome = result?.block ? `BLOCKED: ${result.reason.split("\n")[1] ?? ""}` : "ran";
