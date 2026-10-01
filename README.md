@@ -191,17 +191,65 @@ session branch, so it survives `/tree` navigation but not a new session).
 `jev/auto` appears in `/model`, `--model` and the allowlist like any other model.
 Select it once (or set it as `defaultModel`) and every request is routed:
 
-- `user` requests: Jev reads the latest user message and the candidate list, then
-  answers which model fits, how much reasoning depth it needs, and whether the
-  cheapest candidate is enough.
+- `user` requests: Jev reads the latest user message and a table of the candidates,
+  then answers one question per candidate plus one about depth.
 - `continuation` and `retry` stay on the model that handled the turn, so prompt
   caches and thinking signatures survive.
 - `direct` requests (compaction summaries, extension calls) go to `fallback`.
 - If the endpoint is unreachable or the answer is unusable, `fallback` answers.
 
-Settings: `fallback` (a `provider/id`), `candidates` (defaults to your enabled
-models), `thinkingLevels`, `maxCandidates`. Each routing decision costs one request,
-300-400ms locally.
+The candidate table is built from pi's model registry, so it carries real numbers
+rather than names alone:
+
+```
+[1] anthropic/claude-sonnet-5-5
+    price: $3.00/M input, $15.00/M output
+    limits: 200k context, 64k max output
+    thinking: low, medium, high, xhigh
+    notes: good all-rounder for everyday coding work
+```
+
+`notes` is the only part pi does not know. It comes from `profiles` in settings and is
+passed through verbatim, which is where anything you know about a model goes (that one
+is better at formal proofs, that its low tier matches another model's high tier).
+
+The questions are:
+
+- **fit**, one score per candidate: "How well should this model handle this task,
+  weighing what it costs? The cheapest model that handles it well belongs at the top; a
+  cheap model that only scrapes by does not, however cheap it is." Levels are `cannot`,
+  `poorly`, `adequately`, `well`, `expertly`.
+- **depth**, one score over the levels `jev/auto` advertises, so the answer is a level
+  pi can send. The winner's own levels narrow it further, and a model that cannot think
+  gets `off`.
+
+The highest fit wins. Models within `tieMargin` (0.25) of it count as tied and the
+cheapest of those takes it, which is where the cost preference actually lands: the
+router spends the strongest model only when a weaker one is clearly out of its depth.
+
+Settings: `fallback` (a `provider/id`), `candidates` (defaults to your enabled models),
+`profiles`, `thinkingLevels`, `maxCandidates`, `taskChars`, `tieMargin`. Each routing
+decision is one request, 400-600ms locally.
+
+```json
+"jev-model-router": {
+  "fallback": "anthropic/claude-sonnet-5-5",
+  "profiles": {
+    "anthropic/claude-opus-5-5": "much better at formal proofs and unfamiliar codebases",
+    "google/gemini-3-flash": "fast and cheap, single-step work only"
+  },
+  "tieMargin": 0.25
+}
+```
+
+Measured against the local server on three tasks, with notes in place: a mechanical
+rename scored opus 3.00, sonnet 3.00, flash 1.42 with depth `low`, so the tie went to
+sonnet; a distributed-lock design scored 3.04 / 2.98 / 1.00 with depth `high`, again
+sonnet. Two caveats worth knowing. The gap between opus and sonnet is inside the noise
+(about 0.06), so this router cannot really tell strong models apart and leans on price;
+if you want opus for hard work, say so in `profiles`. And notes swing hard: "struggles
+with multi-step reasoning" dropped flash from 2.88 to 1.42 on a mechanical rename, so
+keep them specific rather than disparaging.
 
 ## Question types
 

@@ -228,23 +228,34 @@ if (process.argv.includes("--route")) {
 	const definition = virtuals.get("jev/auto");
 	if (!definition) throw new Error("jev/auto was not registered");
 
+	// Three shapes of candidate: expensive reasoning model, mid, cheap non-reasoning.
+	const model = (provider, id, name, cost, extra) => ({
+		provider,
+		id,
+		name,
+		contextWindow: 200_000,
+		maxTokens: 64_000,
+		cost: { input: cost, output: cost * 5, cacheRead: cost / 10, cacheWrite: cost },
+		...extra,
+	});
 	const catalog = [
-		{ provider: "anthropic", id: "claude-haiku-4-5", model: { provider: "anthropic", id: "claude-haiku-4-5", name: "haiku" } },
-		{ provider: "anthropic", id: "claude-opus-5-5", model: { provider: "anthropic", id: "claude-opus-5-5", name: "opus" } },
+		{ model: model("anthropic", "claude-opus-5-5", "opus", 5, { reasoning: true, thinkingLevelMap: { off: null, low: "low", medium: "medium", high: "high", xhigh: "max" } }) },
+		{ model: model("anthropic", "claude-sonnet-5-5", "sonnet", 3, { reasoning: true, thinkingLevelMap: { off: null, low: "low", medium: "medium", high: "high", xhigh: "max" } }) },
+		{ model: model("google", "gemini-3-flash", "flash", 0.3, { reasoning: false }) },
 	];
 	const routeCtx = {
 		cwd: root,
 		isProjectTrusted: () => false,
 		getScopedModels: () => catalog,
 		modelRegistry: {
-			find: (provider, id) => catalog.find((m) => m.provider === provider && m.id === id)?.model,
+			find: (provider, id) => catalog.find((m) => m.model.provider === provider && m.model.id === id)?.model,
 		},
 	};
 	const message = (text) => ({ role: "user", content: text });
 	for (const [label, request] of [
 		["user, simple task", { reason: "user", messages: [message("rename a variable across 40 files")], thinkingLevel: "medium" }],
 		["user, hard task", { reason: "user", messages: [message("design a distributed lock protocol and prove it correct under partitions")], thinkingLevel: "medium" }],
-		["continuation", { reason: "continuation", messages: [], previous: { model: catalog[0].model, thinkingLevel: "high" }, thinkingLevel: "medium" }],
+		["continuation", { reason: "continuation", messages: [], previous: { model: catalog[1].model, thinkingLevel: "high" }, thinkingLevel: "medium" }],
 		["direct", { reason: "direct", messages: [], thinkingLevel: "medium" }],
 	]) {
 		const started = Date.now();

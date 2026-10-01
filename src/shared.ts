@@ -50,6 +50,14 @@ export function listOption(options: Record<string, unknown>, key: string, fallba
 	return Array.isArray(value) && value.every((v) => typeof v === "string") ? (value as string[]) : fallback;
 }
 
+/** Read a nested object of strings, e.g. `profiles: { "provider/id": "note" }`. */
+export function objectOption(options: Record<string, unknown>, key: string, fallback: Record<string, string>): Record<string, string> {
+	const value = options[key];
+	if (!value || typeof value !== "object" || Array.isArray(value)) return fallback;
+	const entries = Object.entries(value as Record<string, unknown>).filter(([, v]) => typeof v === "string");
+	return entries.length ? Object.fromEntries(entries) as Record<string, string> : fallback;
+}
+
 export function text(content: string): { content: [{ type: "text"; text: string }] } {
 	return { content: [{ type: "text", text: content }] };
 }
