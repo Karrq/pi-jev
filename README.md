@@ -388,7 +388,7 @@ provider, which on this machine is the free one.
 Settings: `fallback` (a `provider/id`), `candidates` (defaults to your enabled models),
 `profiles`, `thinkingLevels`, `maxCandidates`, `taskChars`, `tieMargin`, `stick`,
 `horizonByLevel`, `horizon`, `downgradeMargin`, `upgradeMargin`, `switchCostFactor`,
-`expectedOutputTokens`, `historyPrompts`, `historyChars`, `record`, `notify`,
+`expectedOutputTokens`, `historyPrompts`, `historyChars`, `record`, `notify`, `debug`,
 `zeroCostPolicy`, `priceFrom`. Each routing decision is one request, 450-550ms locally. Set
 `PI_JEV_ROUTER_DEBUG=1` to have the router print each stickiness decision to stderr.
 
@@ -457,15 +457,22 @@ Continuations, retries, `direct` requests and routing failures are recorded too,
 their reason and no candidates. When the model actually changes, the same summary is
 sent as an ephemeral notification. `record: false` and `notify: false` turn either off.
 
+The recorded `why` describes the change to the model, not to the proposal, since the
+proposal is only a candidate for it: `switched to Jev's pick, which won on fit and
+price`, `stayed: the switch cost $0.05 to write the cache and saved $-0.012 over 1
+turn(s)`, `stayed: the proposal was 0.35 behind on fit, more than the 0.25 allowed`,
+`switched on capability`, or `the current model was Jev's pick anyway`.
+
 To read them back:
 
 ```
 jq -c 'select(.customType=="jev-model-router.decision") | {task, decided}' ~/.pi/agent/sessions/<session>.jsonl
 ```
 
-`PI_JEV_ROUTER_DEBUG=1` still prints the arithmetic live, including every contender's fit
-and turn cost, and is the quicker tool when you are watching a live session rather than
-reading it back.
+`debug` in settings (or `PI_JEV_ROUTER_DEBUG=1`) shows the arithmetic live as a
+notification: the length level and horizon, the turn estimate, every contender's fit and
+turn cost, and what was decided. It goes through the UI rather than stderr, since pi's
+TUI owns the terminal and writing behind its back corrupts the display.
 
 ## Gotchas
 

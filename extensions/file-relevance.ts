@@ -20,12 +20,22 @@ import { systemOne } from "../src/client.ts";
 import { distribution, formatAnswer, topLabel, type JevAnswer, type JevQuestion } from "../src/types.ts";
 import { failure, numberOption, text } from "../src/shared.ts";
 import { readPathPatterns, type SourceBlock } from "../src/sources.ts";
+import { extname, posix } from "node:path";
+
+const MAX_OVERFLOW_GLOBS = 6;
+const MAX_OTHER_SKIPS = 5;
 
 const EXTENSION = "jev-file-relevance";
 
 const FileParams = Type.Object({
 	paths: Type.Array(
-		Type.String({ description: "File or glob, relative to the working directory or absolute. Glob patterns are expanded." }),
+		Type.String({
+			description:
+				"File, directory, or glob, relative to the working directory or absolute; a directory is walked recursively and " +
+				"globs are expanded. No ignore rules apply, so `**` from a repo root fills the maxFiles budget with " +
+				"node_modules and build output: anchor globs to a subtree (`src/**/*.{ts,tsx}`). Only the first maxFiles files " +
+				"are read, which is a latency guard, not a search budget.",
+		}),
 		{ minItems: 1, description: "Files to read" },
 	),
 	questions: Type.Array(
@@ -114,15 +124,79 @@ async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T, index: nu
 	return results;
 }
 
+/**
+ * One glob per directory that overflowed, so the model can ask for the rest by
+ * pattern instead of receiving a line per unread file. Files in a directory that
+ * share a few extensions collapse into a brace pattern; anything wider falls back
+ * to `dir/**\/*`.
+ */
+export function overflowGlobs(origins: string[]): string[] {
+	const byDir = new Map<string, string[]>();
+	for (const origin of origins) {
+		const slash = origin.lastIndexOf("/");
+		const dir = slash < 0 ? "." : origin.slice(0, slash);
+		const ext = extname(origin);
+		const files = byDir.get(dir) ?? [];
+		files.push(ext);
+		byDir.set(dir, files);
+	}
+	// Merge a directory into its parent when every sibling under that parent is also
+	// in the set: node_modules and similar trees collapse to one glob per package.
+	let merged = true;
+	while (merged) {
+		merged = false;
+		const parents = [...byDir.keys()].map((dir) => (dir === "." ? null : dir.slice(0, dir.lastIndexOf("/"))));
+		for (const parent of new Set(parents.filter((p): p is string => p !== null))) {
+			const owned = [...byDir.keys()].filter((dir) => dir !== parent && dir.startsWith(`${parent}/`));
+			if (owned.length === 0) continue;
+			const siblings = [...byDir.keys()].filter((dir) => dir.startsWith(`${parent}/`) && !owned.includes(dir));
+			if (siblings.length) continue;
+			const own = byDir.get(parent);
+			if (!own) continue;
+			const exts = [...own, ...owned.flatMap((dir) => byDir.get(dir) ?? [])];
+			byDir.delete(parent);
+			for (const dir of owned) byDir.delete(dir);
+			byDir.set(parent, exts);
+			merged = true;
+		}
+	}
+	const globs: string[] = [];
+	for (const [dir, exts] of [...byDir].sort(([a], [b]) => (a < b ? -1 : 1))) {
+		const unique = [...new Set(exts)].filter(Boolean).sort();
+		const suffix = unique.length > 0 && unique.length <= 3 ? `*.{${unique.map((e) => e.slice(1)).join(",")}}` : "**/*";
+		globs.push(dir === "." ? suffix : posix.join(dir, suffix));
+	}
+	return globs;
+}
+
+/** Notes for files that were never read: a glob for the overflow, at most a few lines for the rest. */
+export function skipNotes(skipped: { origin: string; reason: string }[], overflowReason: (reason: string) => boolean): string[] {
+	const overflow = skipped.filter((skip) => overflowReason(skip.reason));
+	const other = skipped.filter((skip) => !overflowReason(skip.reason));
+	const notes: string[] = [];
+	if (overflow.length) {
+		const globs = overflowGlobs(overflow.map((skip) => skip.origin));
+		const shown = globs.slice(0, MAX_OVERFLOW_GLOBS);
+		const rest = globs.length - shown.length;
+		notes.push(
+			`not read, ${overflow.length} file(s) match ${shown.join(", ")}${rest > 0 ? `, and ${rest} more pattern(s)` : ""} (raise maxFiles or narrow to these to read them)`,
+		);
+	}
+	for (const skip of other.slice(0, MAX_OTHER_SKIPS)) notes.push(`skipped ${skip.origin} (${skip.reason})`);
+	if (other.length > MAX_OTHER_SKIPS) notes.push(`skipped ${other.length - MAX_OTHER_SKIPS} more file(s) for other reasons`);
+	return notes;
+}
+
 export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "jev_file",
 		label: "Jev File Relevance",
 		description:
-			"Answer typed questions about one or more files (globs allowed) by reading them in chunks: per question the " +
-			"most confident chunk wins, and the answer names the file and character range. Use to check whether files " +
-			"answer a question, or to extract facts from many of them at once, without loading them into context.",
-		promptSnippet: "Answer typed questions about files without loading them into context",
+			"Answer typed questions about many files at once, returning only each answer with the file and character range " +
+			"it came from. Cheap enough to use first whenever a question spans several files or you are unsure which files hold " +
+			"the answer: prefer it over opening files yourself or grepping via `bash`, and survey with a broad glob over the " +
+			"relevant subtree before narrowing to a read.",
+		promptSnippet: "Answer typed questions across many files cheaply, without loading them into context",
 		parameters: FileParams,
 
 		async execute(_id, params, signal, onUpdate, ctx) {
@@ -198,9 +272,8 @@ export default function (pi: ExtensionAPI) {
 				const totalMs = Date.now() - startedAll;
 				const notes = [
 					...found.missing.map((pattern) => `no match: ${pattern}`),
-					...found.skipped.map((skip) => `skipped ${skip.origin} (${skip.reason})`),
+					...skipNotes(found.skipped, (reason) => reason.startsWith("maxFiles")),
 					...(truncatedFiles.length ? [`read only the first ${maxChunks} chunks of: ${truncatedFiles.join(", ")}`] : []),
-					...(found.blocks.length >= maxFiles ? [`stopped at maxFiles ${maxFiles}`] : []),
 				];
 				const header = `[jev file ${endpoint.name}: ${found.blocks.length} file(s), ${totalChars} chars, ${chunks.length} chunk(s), ${totalMs}ms]`;
 

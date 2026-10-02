@@ -390,6 +390,7 @@ export default function (pi: ExtensionAPI) {
 			const historyPrompts = numberOption(options, "historyPrompts", 3);
 			const record = options.record !== false;
 			const notify = options.notify !== false;
+			const debug = debugOn(options);
 			const historyChars = numberOption(options, "historyChars", 240);
 			// What to do when the catalog prices every candidate at zero, which is the case
 			// for subscription bridges and free routers: there are no cache economics to
@@ -538,8 +539,8 @@ export default function (pi: ExtensionAPI) {
 				const contenders = scored.filter((entry) => entry.fit >= best - tieMargin);
 				const proposal = contenders.reduce((a, b) => (b.cost < a.cost ? b : a));
 				let chosen = proposal;
-				if (process.env.PI_JEV_ROUTER_DEBUG) {
-					console.error(
+				if (debug) {
+					debugNotify(ctx, true, [
 						`jev router: length ${LENGTH_LEVELS[lengthIndex]} -> horizon ${horizon}, ` +
 							`turn ~${outputTokens} output tokens over a ${prefixTokens} token prompt. ` +
 							contenders
@@ -551,7 +552,7 @@ export default function (pi: ExtensionAPI) {
 											: `$${entry.cost.toFixed(2)}/task`),
 								)
 								.join(", "),
-					);
+					]);
 				}
 
 				// Stickiness. Switching models means writing a fresh prompt cache, so a cheaper
@@ -561,6 +562,7 @@ export default function (pi: ExtensionAPI) {
 					? scored.find((entry) => entry.candidate.label === labelOf(request.previous!.model))
 					: undefined;
 				let stuck = false;
+				let stayedBecause = "";
 				if (stick && zeroCostPolicy !== "switch" && !priced && current && chosen !== current) {
 					// No prices anywhere: a cache write cannot be weighed against a saving.
 					// "stick" keeps the warm pair, "aa" compares the Artificial Analysis cost
@@ -571,9 +573,12 @@ export default function (pi: ExtensionAPI) {
 					if (!upgrade && (!aaCheaper || !smallEnough)) {
 						chosen = current;
 						stuck = true;
+						stayedBecause = !smallEnough
+							? `the proposal was ${(current.fit - chosen.fit).toFixed(2)} behind on fit, more than the ${downgradeMargin} allowed`
+							: `nothing is priced, so a cache write cannot be weighed against a saving (policy ${zeroCostPolicy})`;
 					}
-					if (process.env.PI_JEV_ROUTER_DEBUG) {
-						console.error(
+					if (debug) {
+						debugNotify(ctx, true, [
 							`jev router: no catalog prices, policy ${zeroCostPolicy}. Proposed ` +
 								`${proposal.candidate.label}@${proposal.level} (fit ${proposal.fit.toFixed(2)}, ` +
 								`$${proposal.cost.toFixed(2)}/task) against ${current.candidate.label}@${current.level} ` +
@@ -581,7 +586,7 @@ export default function (pi: ExtensionAPI) {
 								(stuck
 									? `Staying on ${current.candidate.label}.`
 									: `Switching to ${proposal.candidate.label}${upgrade ? " on capability" : ""}.`),
-						);
+						]);
 					}
 				} else if (stick && priced && current && chosen !== current) {
 					// Staying pays a warm cache read every turn. Switching writes the cache once
@@ -601,9 +606,12 @@ export default function (pi: ExtensionAPI) {
 					if (!upgrade && (!cheaperOverall || !smallEnough)) {
 						chosen = current;
 						stuck = true;
+						stayedBecause = !smallEnough
+							? `the proposal was ${downgrade.toFixed(2)} behind on fit, more than the ${downgradeMargin} allowed`
+							: `the switch cost $${writeCost.toFixed(4)} to write the cache and saved $${(stayTotal - switchTotal).toFixed(4)} over ${horizon} turn(s)`;
 					}
-					if (process.env.PI_JEV_ROUTER_DEBUG) {
-						console.error(
+					if (debug) {
+						debugNotify(ctx, true, [
 							`jev router: length ${LENGTH_LEVELS[lengthIndex]} -> horizon ${horizon}. ` +
 							`Proposed ${proposal.candidate.label}@${proposal.level} (fit ${proposal.fit.toFixed(2)}, ` +
 								`$${switchTotal.toFixed(4)} over ${horizon} turn(s)) against ${current.candidate.label}@${current.level} ` +
@@ -614,16 +622,19 @@ export default function (pi: ExtensionAPI) {
 								(rates(current.candidate) || rates(proposal.candidate)
 									? ` Borrowed rates: ${[rates(current.candidate), rates(proposal.candidate)].filter(Boolean).join(" and ")}.`
 									: ""),
-						);
+						]);
 					}
 				}
-				const why = chosen === proposal
-					? current && proposal !== current
-						? "stayed on the current model"
-						: "Jev's proposal won outright"
-					: chosen === current
-						? "stayed: the switch did not pay for its cache write"
-						: "switched on capability";
+				// Say what happened to the model, not what happened to the proposal: the
+				// proposal is only a candidate for the change, and the change is measured
+				// against the model that was actually in use.
+				const why = !current
+					? "first turn, nothing to stay on"
+					: chosen === current && proposal === current
+						? "the current model was Jev's pick anyway"
+						: chosen === current
+							? `stayed: ${stayedBecause || "the proposal was not better"}`
+							: "switched to Jev's pick, which won on fit and price";
 				recordDecision(
 					ctx,
 					{
@@ -652,7 +663,7 @@ export default function (pi: ExtensionAPI) {
 				);
 				return { model: chosen.candidate.model, thinkingLevel: chosen.level };
 			} catch (error) {
-				if (process.env.PI_JEV_ROUTER_DEBUG) console.error("jev router error:", error);
+				debugNotify(ctx, debug, [`jev router error: ${(error as Error).message}`]);
 				return keep(fallback, request.thinkingLevel, `routing failed: ${(error as Error).message}`);
 			}
 		},
@@ -700,6 +711,24 @@ function argmaxIndex(answer: ScoreAnswerish | undefined, criteria: readonly stri
 }
 
 /** The score answer's winning level, falling back to rounding its mean index. */
+/**
+ * Debug output goes through the UI, never stderr: pi's TUI owns the terminal and writing
+ * to stderr behind its back corrupts the display. Set `debug` in settings or
+ * PI_JEV_ROUTER_DEBUG=1 to see the arithmetic.
+ */
+function debugOn(options: Record<string, unknown>): boolean {
+	return options.debug === true || Boolean(process.env.PI_JEV_ROUTER_DEBUG);
+}
+
+function debugNotify(ctx: ExtensionContext, on: boolean, lines: string[]): void {
+	if (!on) return;
+	try {
+		ctx.ui.notify(lines.join("\n"), "info");
+	} catch {
+		// No UI attached, and stderr would corrupt the TUI.
+	}
+}
+
 /** Where a decision is written down, for reading back out of the session file. */
 const ENTRY_TYPE = "jev-model-router.decision";
 
@@ -762,7 +791,7 @@ function recordDecision(
 	const length = record_.length ? `${record_.length.level}, horizon ${record_.length.horizon}` : "length unknown";
 	try {
 		ctx.ui.notify(
-			`jev: ${record_.previous} -> ${model} @ ${level}\n${why}. Length: ${length}. PI_JEV_ROUTER_DEBUG=1 prints the arithmetic.`,
+			`jev: ${record_.previous} -> ${model} @ ${level}\n${why}. Length: ${length}. Full record in this session's ${ENTRY_TYPE} entries.`,
 			"info",
 		);
 	} catch {

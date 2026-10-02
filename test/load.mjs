@@ -300,15 +300,14 @@ if (process.argv.includes("--route")) {
 
 	// Stickiness: the same proposal, priced against a warm Opus cache, at three turn
 	// sizes. A transcript carries real usage, so the router can size the turn itself.
-	if (process.env.STICKINESS) {
+	if (process.env.CHECK_WHY || process.env.STICKINESS) {
 		// Canned answers so the proposal is known: Opus slightly ahead, Sonnet close
 		// behind and cheaper, which is the case the stickiness rule exists for.
 		const realFetch = globalThis.fetch;
-		const fitsEnv = process.env.FITS;
 		globalThis.fetch = async (_url, init) => {
 			const body = JSON.parse(init.body);
 			const answers = {};
-			const fits = JSON.parse(fitsEnv ?? "[3.0,1.2,2.9,1.0]");
+			const fits = JSON.parse(process.env.FITS ?? "[3.0,1.2,2.9,1.0]");
 			for (const [index, fit] of fits.entries()) {
 				answers[`fit_${index}`] = {
 					type: "score",
@@ -359,7 +358,8 @@ if (process.argv.includes("--route")) {
 			);
 			console.log(`stick output=${String(outputTokens).padStart(5)} -> ${routed.model.id} @ ${routed.thinkingLevel} (${Date.now() - started}ms)`);
 		}
-		globalThis.fetch = realFetch;
+		// CHECK_WHY reuses the canned answers after this block.
+		if (!process.env.CHECK_WHY) globalThis.fetch = realFetch;
 	}
 
 	// A session with history: the state should carry the precedent, so Jev can tell a
@@ -441,6 +441,63 @@ if (process.argv.includes("--route")) {
 		globalThis.fetch = originalFetch;
 		console.log(seen.at(-1));
 	}
+	// The recorded reason has to describe the model change, not the proposal: a switch
+	// reported as a stay is worse than no report.
+	if (process.env.CHECK_WHY) {
+		const scenarios = [
+			// A cheaper model over a long project: the cache write amortises, so it wins.
+			{ label: "switch on price", fits: "[3.0,1.2,2.95,1.0]", previous: 0, length: 4, output: 2000, switched: true },
+			// The same switch on work that ends this turn: the write cannot pay for itself.
+			{ label: "stay, write too big", fits: "[3.0,1.2,2.95,1.0]", previous: 0, length: 0, output: 2000, switched: false },
+			// A clearly stronger model takes over from the free one despite the write.
+			{ label: "switch on capability", fits: "[1.0,3.0,1.2,0.5]", previous: 3, length: 0, output: 20000, switched: true },
+			// Nothing to decide: the current model was the proposal.
+			{ label: "already the pick", fits: "[3.0,1.2,1.2,0.5]", previous: 0, length: 3, output: 2000, switched: false },
+		];
+		for (const scenario of scenarios) {
+			recorded.length = 0;
+			process.env.FITS = scenario.fits;
+			process.env.LENGTH_LEVEL = String(scenario.length);
+			const previous = catalog[scenario.previous].model;
+			const routed = await definition.route(
+				{
+					reason: "user",
+					thinkingLevel: "medium",
+					messages: [
+						{ role: "user", content: "keep going" },
+						{
+							role: "assistant",
+							provider: previous.provider,
+							model: previous.id,
+							content: [{ type: "text", text: "ok" }],
+							usage: {
+								input: 2000,
+								output: scenario.output,
+								cacheRead: 38000,
+								cacheWrite: 0,
+								totalTokens: 0,
+								cost: { total: 0 },
+							},
+						},
+					],
+					previous: { model: previous, thinkingLevel: "medium" },
+				},
+				routeCtx,
+			);
+			const why = recorded.at(-1)?.data?.decided?.why ?? "(nothing recorded)";
+			const changed = `${routed.model.provider}/${routed.model.id}` !== `${previous.provider}/${previous.id}`;
+			const claimsSwitch = /^switched/.test(why);
+			// "stayed" or "was Jev's pick anyway" both mean no change.
+			const claimsStay = /^(stayed|the current model was)/.test(why);
+			const ok = changed === scenario.switched && (changed ? claimsSwitch : claimsStay);
+			console.log(
+				`why ${scenario.label.padEnd(22)} ${changed ? "switched" : "stayed  "} -> ${why}${ok ? "" : "   <-- WRONG"}`,
+			);
+		}
+		delete process.env.LENGTH_LEVEL;
+		delete process.env.FITS;
+	}
+
 	for (const [label, request] of [
 		["user, simple task", { reason: "user", messages: [message("rename a variable across 40 files")], thinkingLevel: "medium" }],
 		["user, trivial task", { reason: "user", messages: [message("what is the capital of France?")], thinkingLevel: "medium" }],
