@@ -246,9 +246,56 @@ where the cost preference lands, and it is what sends low-intelligence work to c
 models. A model Artificial Analysis has not measured falls back to its catalog price, so
 a free local model still wins what it can do.
 
+### Not switching away mid-conversation
+
+Every candidate carries a prompt cache, and a new model starts with none. So before
+leaving the model that just answered, the router prices both paths for the turn it is
+about to run:
+
+```
+jev router: proposed claude-sonnet-5-5@medium (fit 2.95, $0.1600 over 1 turn(s))
+           against claude-opus-5-5@medium (fit 3.00, $0.1760 warm,
+           $0.0800 to write the cache). Switching to claude-sonnet-5-5.
+```
+
+Staying pays a warm cache read every turn. Switching writes the cache once and is warm
+from then on. Both are totalled over `horizon` turns, and the turn is sized from the
+transcript: the prompt is the largest `input + cacheRead + cacheWrite` the last
+assistant message reported, the answer is the mean of its output tokens, and
+`expectedOutputTokens` (2000) stands in when no usage is recorded.
+
+That is why a long turn changes the answer. With a 40k prompt, Opus at medium against
+Sonnet at medium:
+
+| answer tokens | staying on Opus | switching to Sonnet | |
+|---|---|---|---|
+| 400 | $0.024 | $0.104 | stay |
+| 4000 | $0.096 | $0.120 | stay |
+| 8000 | $0.176 | $0.160 | switch |
+| 60000 | $1.216 | $0.700 | switch |
+
+Switching is also refused when the proposal is more than `downgradeMargin` (0.25, half
+of the tie margin) behind on fit. Capability is not priced here, so that is the guard
+rail: a meaningfully worse model stays put however much it saves.
+
+`horizon` (1) is how many turns to amortise over. Larger values make the decision about
+per-turn cost alone, since the one-off write stops mattering; 1 keeps the write decisive.
+
+**When nothing is priced.** Subscription bridges and free routers report every rate as
+zero in pi's catalog, which is the case for every model on this machine. There are no
+cache economics to compare, so `zeroCostPolicy` decides:
+
+| policy | behaviour |
+|---|---|
+| `stick` (default) | Once a pair has answered, a different one is not proposed again unless it is meaningfully better. |
+| `aa` | Compare Artificial Analysis cost per task instead, and switch only for a real saving. |
+| `switch` | No stickiness at all; every turn routes on fit. |
+
 Settings: `fallback` (a `provider/id`), `candidates` (defaults to your enabled models),
-`profiles`, `thinkingLevels`, `maxCandidates`, `taskChars`, `tieMargin`. Each routing
-decision is one request, 450-550ms locally.
+`profiles`, `thinkingLevels`, `maxCandidates`, `taskChars`, `tieMargin`, `stick`,
+`horizon`, `downgradeMargin`, `switchCostFactor`, `expectedOutputTokens`,
+`zeroCostPolicy`. Each routing decision is one request, 450-550ms locally. Set
+`PI_JEV_ROUTER_DEBUG=1` to have the router print each stickiness decision to stderr.
 
 ```json
 "jev-model-router": {

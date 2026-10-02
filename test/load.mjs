@@ -269,6 +269,60 @@ if (process.argv.includes("--route")) {
 		console.log(`route bare ctx (settings fallback) -> ${routed.model.provider}/${routed.model.id} @ ${routed.thinkingLevel} (${Date.now() - started}ms)`);
 	}
 
+	// Stickiness: the same proposal, priced against a warm Opus cache, at three turn
+	// sizes. A transcript carries real usage, so the router can size the turn itself.
+	if (process.env.STICKINESS) {
+		// Canned answers so the proposal is known: Opus slightly ahead, Sonnet close
+		// behind and cheaper, which is the case the stickiness rule exists for.
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = async (_url, init) => {
+			const body = JSON.parse(init.body);
+			const answers = {};
+			const fits = [3.0, 2.95, 1.2, 0.1];
+			for (const [index, fit] of fits.entries()) {
+				answers[`fit_${index}`] = {
+					type: "score",
+					score: fit,
+					confidence: 0.8,
+					legend: {},
+					probabilities: { cannot: 0, poorly: 0, adequately: 1 - fit / 4, well: fit / 4, expertly: 0 },
+				};
+			}
+			answers.depth = {
+				type: "score",
+				score: 2,
+				confidence: 0.8,
+				legend: {},
+				probabilities: { off: 0, low: 0.2, medium: 0.7, high: 0.1, xhigh: 0, max: 0 },
+			};
+			void body;
+			return new Response(JSON.stringify({ answers, usage: { input_tokens: 100 } }), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			});
+		};
+		const opus = catalog[0].model;
+		const transcript = (outputTokens) => [
+			{ role: "user", content: "keep going" },
+			{
+				role: "assistant",
+				provider: opus.provider,
+				model: opus.id,
+				content: [{ type: "text", text: "ok" }],
+				usage: { input: 2000, output: outputTokens, cacheRead: 38000, cacheWrite: 0, totalTokens: 0, cost: {} },
+			},
+		];
+		for (const outputTokens of [400, 4000, 8000, 60000]) {
+			const started = Date.now();
+			const routed = await definition.route(
+				{ reason: "user", messages: transcript(outputTokens), previous: { model: opus, thinkingLevel: "medium" }, thinkingLevel: "medium" },
+				routeCtx,
+			);
+			console.log(`stick output=${String(outputTokens).padStart(5)} -> ${routed.model.id} @ ${routed.thinkingLevel} (${Date.now() - started}ms)`);
+		}
+		globalThis.fetch = realFetch;
+	}
+
 	if (process.env.SHOW_STATE) {
 		// Print the state the router builds, including the Artificial Analysis block.
 		const seen = [];
