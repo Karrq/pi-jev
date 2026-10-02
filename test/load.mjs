@@ -27,6 +27,8 @@ const recorded = [];
 const notified = [];
 const registered = { tools: [], commands: [], events: [], virtualModels: [], schema: [] };
 const tools = new Map();
+// Handlers are kept so a test can fire an event the way pi does, not just check the name.
+const handlers = new Map();
 const stub = {
 	registerTool: (tool) => {
 		tools.set(tool.name, tool);
@@ -35,7 +37,10 @@ const stub = {
 	},
 	registerCommand: (name, options) => registered.commands.push(`${name}: ${options.description}`),
 	registerVirtualModel: (model) => registered.virtualModels.push(`${model.provider}/${model.id} (${model.name}) levels=${model.thinkingLevels.join(",")}`),
-	on: (event) => registered.events.push(event),
+	on: (event, handler) => {
+		registered.events.push(event);
+		handlers.set(event, handler);
+	},
 	registerShortcut: () => {},
 	registerFlag: () => {},
 	registerProvider: () => {},
@@ -271,6 +276,8 @@ if (process.argv.includes("--route")) {
 		ui: { notify: (message, level) => { notified.push({ message, level }); } },
 		isProjectTrusted: () => process.env.TRUSTED === "1",
 		settingsOverride: { profiles: { "openrouter/space-bunny-alpha": { notes: "minimax-m3.1, unreleased, free. Code quality on par with DeepSeek V4 Flash (AA 34), just under GLM 5.3 Flash (AA 42), below both otherwise.", index: 37, costPerTask: 0 } } },
+		// Real pi exposes the enabled set as ctx.scopedModels; the getter is the older shape.
+		scopedModels: catalog,
 		getScopedModels: () => catalog,
 		modelRegistry: {
 			find: (provider, id) => {
@@ -360,6 +367,87 @@ if (process.argv.includes("--route")) {
 		}
 		// CHECK_WHY reuses the canned answers after this block.
 		if (!process.env.CHECK_WHY) globalThis.fetch = realFetch;
+	}
+
+	// A rate-limited model leaves the candidate list, a retry of the request that hit it
+	// re-routes instead of repeating the failure, and the model comes back when the window
+	// the error names has passed.
+	if (process.env.RATE_LIMIT) {
+		const opusLabel = `${catalog[0].model.provider}/${catalog[0].model.id}`;
+		const bridgeError = (resetAt) => ({
+			type: "message_end",
+			ctx: { ...routeCtx },
+			message: {
+				role: "assistant",
+				provider: catalog[0].model.provider,
+				model: catalog[0].model.id,
+				stopReason: "error",
+				errorMessage: `Claude rate limit (five_hour) — quota exceeded, resets 1:40:00 AM: You've hit your session limit [resetsAt=${resetAt}]`,
+			},
+		});
+		const onMessageEnd = handlers.get("message_end");
+		if (!onMessageEnd) throw new Error("the router registered no message_end handler");
+
+		const turn = (output) => [
+			{ role: "user", content: "keep going" },
+			{
+				role: "assistant",
+				provider: catalog[0].model.provider,
+				model: catalog[0].model.id,
+				content: [{ type: "text", text: "x" }],
+				usage: { input: 100, output, cacheRead: 0, cacheWrite: 0, totalTokens: 100 + output, cost: { total: 0 } },
+			},
+		];
+		const routeOnce = async (request) => {
+			recorded.length = 0;
+			const routed = await definition.route(request, routeCtx);
+			const entry = recorded.at(-1)?.data ?? {};
+			return {
+				routed,
+				entry,
+				pool: (entry.candidates ?? []).map((c) => c.label),
+				down: (entry.suppressed ?? []).map((c) => c.label),
+			};
+		};
+		const check = (label, ok, detail) => console.log(`limited ${label.padEnd(26)} ${ok ? "ok" : "FAILED"}  ${detail}`);
+
+		// A limit two hours out: the model leaves the candidate list and the state says why.
+		onMessageEnd(bridgeError(Math.floor(Date.now() / 1000) + 7200));
+		const limited = await routeOnce({ reason: "user", thinkingLevel: "medium", messages: turn(500) });
+		check("excluded while limited", !limited.pool.includes(opusLabel) && limited.down.includes(opusLabel), `pool: ${limited.pool.join(", ") || "none"}`);
+		check("reason names the limit", /rate limited: claude-bridge\/claude-opus-5-5/.test(limited.entry.decided?.why ?? ""), limited.entry.decided?.why);
+
+		// A retry is the case that matters: staying on the model that just refused fails the
+		// same way, so it has to re-route.
+		const retried = await routeOnce({
+			reason: "retry",
+			thinkingLevel: "medium",
+			messages: turn(500),
+			failed: { model: catalog[0].model, thinkingLevel: "medium" },
+		});
+		check(
+			"retry re-routes",
+			retried.routed.model.id !== catalog[0].model.id && /re-routed/.test(retried.entry.decided?.why ?? ""),
+			`-> ${retried.routed.model.id} @ ${retried.routed.thinkingLevel}, ${retried.entry.decided?.why}`,
+		);
+
+		// A retry that failed for some other reason still stays put, cache and all.
+		const retriedElsewhere = await routeOnce({
+			reason: "retry",
+			thinkingLevel: "medium",
+			messages: turn(500),
+			failed: { model: catalog[1].model, thinkingLevel: "medium" },
+		});
+		check(
+			"other retry stays",
+			retriedElsewhere.routed.model.id === catalog[1].model.id,
+			`-> ${retriedElsewhere.routed.model.id} (${retriedElsewhere.entry.decided?.why})`,
+		);
+
+		// The window the error named has passed: no timer, the next route simply sees it again.
+		onMessageEnd(bridgeError(Math.floor(Date.now() / 1000) - 60));
+		const restored = await routeOnce({ reason: "user", thinkingLevel: "medium", messages: turn(500) });
+		check("back when the window lifts", restored.pool.includes(opusLabel) && restored.down.length === 0, `pool: ${restored.pool.join(", ") || "none"}`);
 	}
 
 	// A session with history: the state should carry the precedent, so Jev can tell a
@@ -513,8 +601,6 @@ if (process.argv.includes("--route")) {
 
 if (process.argv.includes("--gate")) {
 	// Drive the bash tool_call hook the way pi does when the model asks for a command.
-	const handlers = new Map();
-	stub.on = (event, handler) => handlers.set(event, handler);
 	const module = await jiti.import(join(root, "extensions", "bash-gate.ts"));
 	(module.default ?? module)(stub);
 	const hook = handlers.get("tool_call");

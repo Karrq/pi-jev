@@ -8,7 +8,14 @@
  * few thousand tokens. Per question the most confident chunk wins.
  *
  * Settings: overrides["jev-file-relevance"] = { chunkChars, overlapChars, maxChunks,
- * maxFiles, maxFileBytes, maxQuestions, concurrency }
+ * maxFiles, filesPerRequest, maxBatchChars, maxFileBytes, maxQuestions, concurrency }
+ *
+ * maxFiles is how much of the tree is read at all (200 by default); the read set is
+ * then split into requests of at most filesPerRequest files and maxBatchChars
+ * characters so each request stays quick.
+ *
+ * Patterns follow .gitignore, so a `**` scan does not read node_modules. A pattern
+ * may opt out with the `i` flag, `<i>/**`.
  *
  * Toggle: "+extensions/file-relevance.ts" in the package's extension list.
  */
@@ -19,8 +26,8 @@ import { resolve } from "../src/config.ts";
 import { systemOne } from "../src/client.ts";
 import { distribution, formatAnswer, topLabel, type JevAnswer, type JevQuestion } from "../src/types.ts";
 import { failure, numberOption, text } from "../src/shared.ts";
-import { readPathPatterns, type SourceBlock } from "../src/sources.ts";
-import { extname, posix } from "node:path";
+import { readPathPatterns, expandPattern, type SourceBlock } from "../src/sources.ts";
+import { extname, posix, relative } from "node:path";
 
 const MAX_OVERFLOW_GLOBS = 6;
 const MAX_OTHER_SKIPS = 5;
@@ -32,9 +39,10 @@ const FileParams = Type.Object({
 		Type.String({
 			description:
 				"File, directory, or glob, relative to the working directory or absolute; a directory is walked recursively and " +
-				"globs are expanded. No ignore rules apply, so `**` from a repo root fills the maxFiles budget with " +
-				"node_modules and build output: anchor globs to a subtree (`src/**/*.{ts,tsx}`). Only the first maxFiles files " +
-				"are read, which is a latency guard, not a search budget.",
+				"globs are expanded. .gitignore applies, so `**` skips node_modules and build output; prefix a pattern with " +
+				"<i>/ to include those. Files are read in the order given, and only the first maxFiles are read, which is a " +
+				"latency guard rather than a search budget. A scan reads more than a few files and asks about them in " +
+				"several small requests, so a wide pattern is cheap.",
 		}),
 		{ minItems: 1, description: "Files to read" },
 	),
@@ -143,6 +151,8 @@ export function overflowGlobs(origins: string[]): string[] {
 	// Merge a directory into its parent when every sibling under that parent is also
 	// in the set: node_modules and similar trees collapse to one glob per package.
 	let merged = true;
+	// A directory that absorbed children needs `**` to still cover what it absorbed.
+	const deep = new Set<string>();
 	while (merged) {
 		merged = false;
 		const parents = [...byDir.keys()].map((dir) => (dir === "." ? null : dir.slice(0, dir.lastIndexOf("/"))));
@@ -151,36 +161,87 @@ export function overflowGlobs(origins: string[]): string[] {
 			if (owned.length === 0) continue;
 			const siblings = [...byDir.keys()].filter((dir) => dir.startsWith(`${parent}/`) && !owned.includes(dir));
 			if (siblings.length) continue;
-			const own = byDir.get(parent);
-			if (!own) continue;
+			const own = byDir.get(parent) ?? [];
 			const exts = [...own, ...owned.flatMap((dir) => byDir.get(dir) ?? [])];
 			byDir.delete(parent);
 			for (const dir of owned) byDir.delete(dir);
 			byDir.set(parent, exts);
+			deep.add(parent);
 			merged = true;
 		}
 	}
 	const globs: string[] = [];
 	for (const [dir, exts] of [...byDir].sort(([a], [b]) => (a < b ? -1 : 1))) {
 		const unique = [...new Set(exts)].filter(Boolean).sort();
-		const suffix = unique.length > 0 && unique.length <= 3 ? `*.{${unique.map((e) => e.slice(1)).join(",")}}` : "**/*";
-		globs.push(dir === "." ? suffix : posix.join(dir, suffix));
+		const brace = unique.length > 0 && unique.length <= 3 ? `*.{${unique.map((e) => e.slice(1)).join(",")}}` : null;
+		// `brace` names the extensions; a directory that absorbed children needs `**`
+		// so the pattern still matches what it took in.
+		const body = brace === null ? "**/*" : deep.has(dir) ? `**/${brace}` : brace;
+		globs.push(dir === "." ? (brace === null ? body : brace) : posix.join(dir, body));
 	}
 	return globs;
 }
 
+/**
+ * Group chunks into requests bounded by both file count and characters. Reading
+ * 200 files is then a run of small fast requests rather than one slow one.
+ */
+export function batchChunks(chunks: Chunk[], maxFiles: number, maxChars: number): Chunk[][] {
+	const batches: Chunk[][] = [];
+	let current: Chunk[] = [];
+	let chars = 0;
+	const files = new Set<number>();
+	for (const chunk of chunks) {
+		const size = chunk.text.length;
+		const full = current.length > 0 && (files.size >= maxFiles || chars + size > maxChars);
+		if (full) {
+			batches.push(current);
+			current = [];
+			chars = 0;
+			files.clear();
+		}
+		current.push(chunk);
+		chars += size;
+		files.add(chunk.source);
+	}
+	if (current.length) batches.push(current);
+	return batches;
+}
+
 /** Notes for files that were never read: a glob for the overflow, at most a few lines for the rest. */
-export function skipNotes(skipped: { origin: string; reason: string }[], overflowReason: (reason: string) => boolean): string[] {
+export async function skipNotes(
+	skipped: { origin: string; reason: string }[],
+	overflowReason: (reason: string) => boolean,
+	cwd: string,
+	readPaths: Set<string>,
+): Promise<string[]> {
 	const overflow = skipped.filter((skip) => overflowReason(skip.reason));
 	const other = skipped.filter((skip) => !overflowReason(skip.reason));
 	const notes: string[] = [];
 	if (overflow.length) {
-		const globs = overflowGlobs(overflow.map((skip) => skip.origin));
+		// Propose globs for what is left: expand them, drop everything already read, and
+		// describe the remainder, so following up does not re-read the same files.
+		const candidates = overflowGlobs(overflow.map((skip) => skip.origin));
+		const unread = new Set<string>();
+		for (const glob of candidates) {
+			for (const match of await expandPattern(glob, cwd)) {
+				const rel = relative(cwd, match);
+				if (!readPaths.has(rel) && !readPaths.has(match)) unread.add(rel);
+			}
+		}
+		// Anything the globs missed (an ignore rule the follow-up would also skip) stays
+		// listed by name, capped.
+		const remaining = overflow.map((skip) => skip.origin).filter((origin) => !unread.has(origin));
+		const globs = overflowGlobs([...unread]);
 		const shown = globs.slice(0, MAX_OVERFLOW_GLOBS);
 		const rest = globs.length - shown.length;
-		notes.push(
-			`not read, ${overflow.length} file(s) match ${shown.join(", ")}${rest > 0 ? `, and ${rest} more pattern(s)` : ""} (raise maxFiles or narrow to these to read them)`,
-		);
+		if (shown.length) {
+			notes.push(
+				`not read, ${unread.size} file(s) still match ${shown.join(", ")}${rest > 0 ? `, and ${rest} more pattern(s)` : ""} (these exclude what was just read; raise maxFiles to include them)`,
+			);
+		}
+		for (const origin of remaining.slice(0, MAX_OTHER_SKIPS)) notes.push(`not read, no single pattern covers it: ${origin}`);
+		if (remaining.length > MAX_OTHER_SKIPS) notes.push(`not read, ${remaining.length - MAX_OTHER_SKIPS} more file(s) with no single pattern`);
 	}
 	for (const skip of other.slice(0, MAX_OTHER_SKIPS)) notes.push(`skipped ${skip.origin} (${skip.reason})`);
 	if (other.length > MAX_OTHER_SKIPS) notes.push(`skipped ${other.length - MAX_OTHER_SKIPS} more file(s) for other reasons`);
@@ -206,10 +267,14 @@ export default function (pi: ExtensionAPI) {
 			const chunkChars = numberOption(options, "chunkChars", 16_000);
 			const overlapChars = numberOption(options, "overlapChars", 1_000);
 			const maxChunks = numberOption(options, "maxChunks", 8);
-			const maxFiles = numberOption(options, "maxFiles", 20);
+			const maxFiles = numberOption(options, "maxFiles", 200);
 			const maxFileBytes = numberOption(options, "maxFileBytes", 2 << 20);
 			const concurrency = numberOption(options, "concurrency", 1);
 			const maxQuestions = numberOption(options, "maxQuestions", 12);
+			// One request covers at most this many files and this many characters, so a
+			// 200-file scan stays a sequence of small fast requests instead of one slow one.
+			const filesPerRequest = numberOption(options, "filesPerRequest", 20);
+			const maxBatchChars = numberOption(options, "maxBatchChars", 48_000);
 
 			try {
 				const found = await readPathPatterns(params.paths, { cwd: ctx.cwd, maxFileBytes, maxFiles });
@@ -246,10 +311,23 @@ export default function (pi: ExtensionAPI) {
 					return `${where}\n\n${chunk.text}`;
 				};
 
+				const batches = batchChunks(chunks, filesPerRequest, maxBatchChars);
 				const startedAll = Date.now();
-				const answers = await mapLimit(chunks, concurrency, async (chunk) => {
-					const result = await systemOne(endpoint, stateOf(chunk), questions, { signal });
-					return { chunk, answers: result.answers, elapsedMs: result.elapsedMs };
+				let done = 0;
+				const answers = await mapLimit(batches, concurrency, async (batch) => {
+					const state = batch.map(stateOf).join("\n\n");
+					const result = await systemOne(endpoint, state, questions, { signal });
+					done++;
+					onUpdate?.({
+						content: [
+							{
+								type: "text",
+								text: `Asked ${done}/${batches.length} request(s): ${batch.length} chunk(s), ${batch.reduce((sum, chunk) => sum + chunk.text.length, 0)} chars`,
+							},
+						],
+						details: { files: found.blocks.length, chars: totalChars, chunks: chunks.length, requests: batches.length, done },
+					});
+					return { batch, answers: result.answers, elapsedMs: result.elapsedMs };
 				});
 
 				const best: Record<string, { answer: JevAnswer; chunk: Chunk }> = {};
@@ -272,7 +350,12 @@ export default function (pi: ExtensionAPI) {
 				const totalMs = Date.now() - startedAll;
 				const notes = [
 					...found.missing.map((pattern) => `no match: ${pattern}`),
-					...skipNotes(found.skipped, (reason) => reason.startsWith("maxFiles")),
+					...(await skipNotes(
+						found.skipped,
+						(reason) => reason.startsWith("maxFiles"),
+						ctx.cwd,
+						new Set(found.blocks.map((block) => block.label)),
+					)),
 					...(truncatedFiles.length ? [`read only the first ${maxChunks} chunks of: ${truncatedFiles.join(", ")}`] : []),
 				];
 				const header = `[jev file ${endpoint.name}: ${found.blocks.length} file(s), ${totalChars} chars, ${chunks.length} chunk(s), ${totalMs}ms]`;

@@ -389,7 +389,7 @@ Settings: `fallback` (a `provider/id`), `candidates` (defaults to your enabled m
 `profiles`, `thinkingLevels`, `maxCandidates`, `taskChars`, `tieMargin`, `stick`,
 `horizonByLevel`, `horizon`, `downgradeMargin`, `upgradeMargin`, `switchCostFactor`,
 `expectedOutputTokens`, `historyPrompts`, `historyChars`, `record`, `notify`, `debug`,
-`zeroCostPolicy`, `priceFrom`. Each routing decision is one request, 450-550ms locally. Set
+`zeroCostPolicy`, `priceFrom`, `respectRateLimits`, `rateLimitMinutes`. Each routing decision is one request, 450-550ms locally. Set
 `PI_JEV_ROUTER_DEBUG=1` to have the router print each stickiness decision to stderr.
 
 ```json
@@ -426,6 +426,50 @@ reasoning" dropped one model from 2.88 to 1.42 on a rename that was never multi-
 
 Criteria are plain strings; a choice criterion may carry its own text as
 `"label: description"`.
+
+## Rate limits
+
+A model that comes back with a rate limit leaves the candidate list for exactly as long as
+the limit lasts, and comes back on its own. There is no timer and nothing to undo: the
+next routing call simply looks again.
+
+The window comes from the error when the provider says it. The bridge in use here reports
+
+```
+Claude rate limit (five_hour) — quota exceeded, resets 1:40:00 AM: You've hit your session limit [resetsAt=1790725200]
+```
+
+and that `resetsAt` is used directly, so the model returns at the moment the window lifts.
+A reset time that has already passed is taken at its word, since that is the error saying
+the window is over. A plain `429` with no reset time falls back to `rateLimitMinutes`,
+10 by default.
+
+A rate-limited model is dropped from the state Jev sees, with a line saying why:
+
+```
+Rate limited, out of the running: claude-bridge/claude-opus-5-5 (back in 2h 13m)
+```
+
+and from the `fallback`, so a rate-limited default cannot send every non-routed turn into
+the same wall. Two cases get special treatment:
+
+- **A retry** normally stays on the model that failed, so the prompt cache and any thinking
+  signature survive. A retry after a *rate limit* is the exception: staying would fail
+  identically, so it re-routes on the healthy candidates and says so in the record.
+- **A continuation** still stays. Nothing was refused, the model simply ran out of room
+  mid-answer, and the rest of the answer is worth keeping on the same model.
+
+If every candidate is limited, the router takes the one whose window lifts soonest and
+records that it had no choice. The decision record lists what was suppressed and the
+recorded reason ends with it:
+
+```json
+"decided": { "model": "claude-bridge/claude-sonnet-5-5", "level": "low",
+             "why": "first turn, nothing to stay on (1 rate limited: claude-bridge/claude-opus-5-5)" }
+```
+
+`respectRateLimits: false` turns the whole thing off, and `rateLimitMinutes` sets the
+fallback window.
 
 ## Reading the decisions back
 

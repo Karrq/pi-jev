@@ -10,6 +10,7 @@ import { spawn } from "node:child_process";
 import { readFile, stat } from "node:fs/promises";
 import { isAbsolute, relative, resolve as resolvePath } from "node:path";
 import { glob } from "node:fs/promises";
+import { Gitignore } from "./gitignore.ts";
 
 export interface SourceBlock {
 	/** How this block is labelled in the request and in the result details. */
@@ -35,6 +36,19 @@ export interface ResolveOptions {
 	maxMatches?: number;
 }
 
+/**
+ * `<i>/src/**` -> { pattern: "src/**", includeIgnored: true }. An unknown flag is
+ * an error. Without flags a pattern skips whatever .gitignore would.
+ */
+export function parsePattern(raw: string): { pattern: string; includeIgnored: boolean } {
+	const match = /^<([a-z]*)>\/(.+)$/.exec(raw);
+	if (!match) return { pattern: raw, includeIgnored: false };
+	const flags = new Set(match[1].split(""));
+	const unknown = [...flags].filter((flag) => flag !== "i");
+	if (unknown.length) throw new Error(`unknown flag(s) ${unknown.map((flag) => `<${flag}>`).join(", ")} in pattern ${raw}; only <i> (include gitignored files) exists`);
+	return { pattern: match[2], includeIgnored: flags.has("i") };
+}
+
 const DEFAULT_MAX_FILE_BYTES = 2 << 20;
 const DEFAULT_MAX_FILES = 40;
 
@@ -44,6 +58,9 @@ const DEFAULT_MAX_FILES = 40;
  * A plain path is read as-is. A glob (`src/**` + `/ *.ts`, or `*.log`) is expanded,
  * and a directory is walked recursively for files. Results are sorted and
  * deduplicated so two patterns matching the same file produce one block.
+ *
+ * A pattern may carry `<flags>/` in front of it; `i` includes the files and
+ * directories .gitignore excludes, which are skipped otherwise.
  */
 export async function readPathPatterns(patterns: string[], options: ResolveOptions): Promise<{
 	blocks: SourceBlock[];
@@ -55,14 +72,29 @@ export async function readPathPatterns(patterns: string[], options: ResolveOptio
 	const skipped: { origin: string; reason: string }[] = [];
 	const seen = new Set<string>();
 	const blocks: SourceBlock[] = [];
+	const gitignore = await Gitignore.load(cwd);
+	const memo = new Map<string, boolean>();
+	// Filtering happens after expansion: node's glob cannot prune by .gitignore.
+	const keep = async (path: string) => {
+		let cached = memo.get(path);
+		if (cached === undefined) {
+			cached = !(await gitignore.isIgnored(path));
+			memo.set(path, cached);
+		}
+		return cached;
+	};
 
-	for (const pattern of patterns) {
+	for (const raw of patterns) {
+		const { pattern, includeIgnored } = parsePattern(raw);
 		const absolute = isAbsolute(pattern) ? pattern : resolvePath(cwd, pattern);
 		const isGlob = /[*?[{]/.test(pattern);
 		let candidates: string[];
 		if (isGlob) {
 			candidates = [];
-			for await (const match of glob(absolute, { withFileTypes: false })) candidates.push(String(match));
+			for await (const match of glob(absolute, { withFileTypes: false })) {
+				const file = String(match);
+				if (includeIgnored || (await keep(file))) candidates.push(file);
+			}
 		} else {
 			candidates = [absolute];
 		}
@@ -82,6 +114,7 @@ export async function readPathPatterns(patterns: string[], options: ResolveOptio
 			if (info.isDirectory()) {
 				for await (const match of glob(resolvePath(candidate, "**/*"), { withFileTypes: false })) {
 					const file = String(match);
+					if (!includeIgnored && !(await keep(file))) continue;
 					if (seen.has(file)) continue;
 					seen.add(file);
 					const entry = await readOne(file, cwd, maxFileBytes, blocks, skipped);
@@ -131,6 +164,14 @@ async function readOne(
 	}
 	blocks.push({ label: rel, origin: rel, path: file, text, originalBytes: info.size, truncated: false });
 	return true;
+}
+
+/** Every file a pattern matches, ignored directories included. Used to describe what was not read. */
+export async function expandPattern(pattern: string, cwd: string): Promise<string[]> {
+	const absolute = isAbsolute(pattern) ? pattern : resolvePath(cwd, pattern);
+	const matches: string[] = [];
+	for await (const match of glob(absolute, { withFileTypes: false })) matches.push(String(match));
+	return matches;
 }
 
 export interface CommandResult {

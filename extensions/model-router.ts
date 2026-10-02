@@ -354,6 +354,31 @@ function nearestLevel(requested: string, allowed: readonly Level[]): Level {
 }
 
 export default function (pi: ExtensionAPI) {
+	// A rate limit is the one failure the router has to hear about: pi retries it, aborts,
+	// and hands control back, and without this the next turn asks Jev about a model that
+	// cannot answer. The reset time in the error is used when present, so the model returns
+	// on its own the moment the window lifts, with no timer and no bookkeeping.
+	pi.on("message_end", (event) => {
+		const message = event.message;
+		if (message.role !== "assistant" || message.stopReason !== "error") return;
+		const errorMessage = message.errorMessage ?? "";
+		if (!isRateLimited(errorMessage)) return;
+		const { options } = resolve(process.cwd(), EXTENSION, event.ctx.isProjectTrusted());
+		if (options.respectRateLimits === false) return;
+		const label = `${message.provider}/${message.model}`;
+		quarantine({ provider: message.provider, id: message.model }, errorMessage, numberOption(options, "rateLimitMinutes", 10));
+		const until = downUntil(label);
+		if (until === undefined) return;
+		try {
+			event.ctx.ui.notify(
+				`jev: ${label} is rate limited, out of the running ${whenLabel(until)}. The router will bring it back when the window lifts.`,
+				"warn",
+			);
+		} catch {
+			// No UI attached.
+		}
+	});
+
 	pi.registerVirtualModel({
 		provider: VIRTUAL_PROVIDER,
 		id: VIRTUAL_ID,
@@ -398,6 +423,11 @@ export default function (pi: ExtensionAPI) {
 			const zeroCostPolicy = (["stick", "switch", "aa"] as const).includes(options.zeroCostPolicy as never)
 				? (options.zeroCostPolicy as "stick" | "switch" | "aa")
 				: "stick";
+			// A model that just hit a rate limit is not a candidate, and neither is a retry of
+			// the request that hit it. The window comes from the error when it says, and from
+			// this many minutes when it does not.
+			const respectRateLimits = options.respectRateLimits !== false;
+			const rateLimitMinutes = numberOption(options, "rateLimitMinutes", 10);
 
 			const enabled = enabledLabels(ctx).filter((label) => label !== `${VIRTUAL_PROVIDER}/${VIRTUAL_ID}`);
 			const configured = listOption(options, "candidates", []);
@@ -409,9 +439,24 @@ export default function (pi: ExtensionAPI) {
 					`jev-model-router: no candidate models. Set overrides["${EXTENSION}"].candidates or enable models with credentials.`,
 				);
 			}
-			const fallback =
-				candidates.find((candidate) => candidate.label === fallbackLabel)?.model ?? candidates[0].model;
 			const priced = candidates.some((candidate) => candidate.input > 0 || candidate.output > 0);
+
+			// Split the candidates by whether their limit has lifted. If everything is down,
+			// the one whose limit lifts soonest is the least bad choice, and saying so beats
+			// routing blind into a wall.
+			const all = candidates;
+			const down = all.filter((candidate) => respectRateLimits && downUntil(candidate.label) !== undefined);
+			const healthy = all.filter((candidate) => !down.includes(candidate));
+			const onlyWhenAllDown = healthy.length === 0;
+			const pool = onlyWhenAllDown
+				? [...down].sort((a, b) => (downUntil(a.label) ?? Infinity) - (downUntil(b.label) ?? Infinity)).slice(0, 2)
+				: healthy;
+			const suppressed = down
+				.filter((candidate) => !pool.includes(candidate))
+				.map((candidate) => ({ label: candidate.label, until: new Date(downUntil(candidate.label) ?? 0).toISOString() }));
+			// The fallback is chosen from what is actually available, so a rate-limited default
+			// cannot send every non-routed turn into the same wall.
+			const fallback = pool.find((candidate) => candidate.label === fallbackLabel)?.model ?? pool[0].model;
 
 			// Keep the turn together: continuation and retry stay on the same model so
 			// prompt caches and thinking signatures survive.
@@ -434,15 +479,29 @@ export default function (pi: ExtensionAPI) {
 			if (request.reason === "continuation" && request.previous) {
 				return keep(request.previous.model, request.previous.thinkingLevel, "continuation, kept for prompt cache");
 			}
-			if (request.reason === "retry" && request.failed) {
+			// A retry normally stays on the model that failed, so the prompt cache and any
+			// thinking signature survive. A retry after a *rate limit* is the exception:
+			// staying would fail identically, so it re-routes on the healthy candidates.
+			const retriedAfterLimit =
+				request.reason === "retry" &&
+				request.failed !== undefined &&
+				respectRateLimits &&
+				downUntil(labelOf(request.failed.model)) !== undefined;
+			if (request.reason === "retry" && request.failed && !retriedAfterLimit) {
 				return keep(request.failed.model, request.failed.thinkingLevel, "retry, kept on the failed model");
 			}
-			if (request.reason !== "user" || candidates.length < 2) {
-				return keep(fallback, request.thinkingLevel, `${request.reason}, went to the fallback`);
+			if ((request.reason !== "user" && !retriedAfterLimit) || pool.length < 2) {
+				const why =
+					pool.length === 1
+						? `only candidate available, ${suppressed.length} rate limited`
+						: onlyWhenAllDown
+							? "every candidate is rate limited, taking the one that recovers first"
+							: `${request.reason}, went to the fallback`;
+				return keep(fallback, request.thinkingLevel, why);
 			}
 
 			const task = lastUserText(request.messages).slice(0, taskChars);
-			const history = sessionHistory(request.messages, candidates, historyPrompts, historyChars).map(
+			const history = sessionHistory(request.messages, pool, historyPrompts, historyChars).map(
 				(record_) =>
 					`"${record_.prompt}" took ${record_.turns} turn${record_.turns === 1 ? "" : "s"} on ${record_.models.join(", ")}, ` +
 					`$${record_.cost < 0.01 ? record_.cost.toFixed(4) : record_.cost.toFixed(3)}${record_.estimated ? " estimated" : ""} ` +
@@ -454,8 +513,16 @@ export default function (pi: ExtensionAPI) {
 				...(history.length
 					? ["Earlier prompts in this session, and what answering them actually took:", ...history.map((line) => `  ${line}`), ""]
 					: []),
+				...(suppressed.length
+					? [
+							`Rate limited, out of the running: ${suppressed
+								.map((entry) => `${entry.label} (back ${whenLabel(Date.parse(entry.until))})`)
+								.join(", ")}`,
+							"",
+						]
+					: []),
 				"Candidate models:",
-				...candidates.map(describe),
+				...pool.map(describe),
 			].join("\n");
 			// Depth is asked on the levels `jev/auto` advertises and then narrowed by name
 			// to the winner's own levels. Intersecting them here instead would collapse the
@@ -510,7 +577,7 @@ export default function (pi: ExtensionAPI) {
 				// With no transcript to learn from, a longer piece of work gets a longer
 				// first answer to divide by.
 				const outputTokens = measured ?? defaultOutputTokens * horizon;
-				const scored: Scored[] = candidates
+				const scored: Scored[] = pool
 					.map((candidate, index) => {
 						const answer = result.answers[`fit_${index}`];
 						const level = nearestLevel(requested, candidate.levels);
@@ -629,12 +696,18 @@ export default function (pi: ExtensionAPI) {
 				// proposal is only a candidate for the change, and the change is measured
 				// against the model that was actually in use.
 				const why = !current
-					? "first turn, nothing to stay on"
+					? retriedAfterLimit
+						? `re-routed: ${labelOf(request.failed!.model)} is rate limited until ${new Date(downUntil(labelOf(request.failed!.model)) ?? 0).toLocaleTimeString()}`
+						: "first turn, nothing to stay on"
 					: chosen === current && proposal === current
 						? "the current model was Jev's pick anyway"
 						: chosen === current
 							? `stayed: ${stayedBecause || "the proposal was not better"}`
 							: "switched to Jev's pick, which won on fit and price";
+				// A model left out of the running is part of the reason, not a footnote.
+				const limited = suppressed.length
+					? ` (${suppressed.length} rate limited: ${suppressed.map((entry) => entry.label).join(", ")})`
+					: "";
 				recordDecision(
 					ctx,
 					{
@@ -645,6 +718,7 @@ export default function (pi: ExtensionAPI) {
 						length: { level: LENGTH_LEVELS[lengthIndex], score: result.answers.length?.score, horizon },
 						depth: { level: requested, score: result.answers.depth?.score },
 						turn: { promptTokens: prefixTokens, outputTokens },
+						suppressed,
 						candidates: scored.map((entry) => ({
 							label: entry.candidate.label,
 							level: entry.level,
@@ -655,7 +729,7 @@ export default function (pi: ExtensionAPI) {
 							coldTurn: Math.round(entry.coldTurn * 10000) / 10000,
 							...(entry.candidate.pricedFrom ? { ratesFrom: entry.candidate.pricedFrom } : {}),
 						})),
-						decided: { model: chosen.candidate.label, level: chosen.level, why },
+						decided: { model: chosen.candidate.label, level: chosen.level, why: why + limited },
 						answers: recordAnswers(result),
 					},
 					record,
@@ -727,6 +801,65 @@ function debugNotify(ctx: ExtensionContext, on: boolean, lines: string[]): void 
 	} catch {
 		// No UI attached, and stderr would corrupt the TUI.
 	}
+}
+
+/**
+ * Models that just hit a rate limit, with the moment they come back.
+ *
+ * Provider errors carry the reset time, so a quarantined model leaves the candidate list
+ * exactly as long as the limit lasts and no longer: the bridge in use here reports
+ * "quota exceeded ... [resetsAt=1789...]", which is used directly, and a plain 429 without
+ * one falls back to a fixed window.
+ */
+const quarantined = new Map<string, { until: number; reason: string }>();
+
+const RATE_LIMIT = /rate.?limit|too many requests|\b429\b|quota exceeded|usage limit|overloaded/i;
+
+function modelKey(model: { provider?: string; id?: string } | undefined): string | undefined {
+	return model?.provider && model?.id ? `${model.provider}/${model.id}` : undefined;
+}
+
+/** The moment a rate limit lifts, in epoch milliseconds, if the error says. */
+export function rateLimitResetAt(message: string): number | undefined {
+	const match = /resetsAt=(\d+)/.exec(message);
+	if (match) return Number(match[1]) * 1000;
+	return undefined;
+}
+
+export function isRateLimited(message: string | undefined): boolean {
+	return Boolean(message) && RATE_LIMIT.test(message as string);
+}
+
+function quarantine(model: { provider?: string; id?: string }, errorMessage: string, ttlMinutes: number): void {
+	const key = modelKey(model);
+	if (!key) return;
+	// A reset time in the error is taken at its word, including when it has already passed:
+	// that is the error saying the window is over, not a stale clock.
+	const resetAt = rateLimitResetAt(errorMessage);
+	const until = resetAt ?? Date.now() + ttlMinutes * 60_000;
+	quarantined.set(key, {
+		until,
+		reason: (errorMessage.split(":")[0] ?? "rate limit").trim().slice(0, 120),
+	});
+}
+
+/** A quarantined model comes back on its own once the window passes. */
+function downUntil(label: string): number | undefined {
+	const entry = quarantined.get(label);
+	if (!entry) return undefined;
+	if (entry.until <= Date.now()) {
+		quarantined.delete(label);
+		return undefined;
+	}
+	return entry.until;
+}
+
+function whenLabel(until: number): string {
+	const minutes = Math.round((until - Date.now()) / 60_000);
+	if (minutes < 1) return "in under a minute";
+	if (minutes < 60) return `in ${minutes} min`;
+	const hours = Math.floor(minutes / 60);
+	return `in ${hours}h ${minutes % 60}m`;
 }
 
 /** Where a decision is written down, for reading back out of the session file. */
