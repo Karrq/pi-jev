@@ -302,7 +302,7 @@ if (process.argv.includes("--route")) {
 		globalThis.fetch = async (_url, init) => {
 			const body = JSON.parse(init.body);
 			const answers = {};
-			const fits = JSON.parse(fitsEnv ?? "[3.0,2.95,1.2,0.8]");
+			const fits = JSON.parse(fitsEnv ?? "[3.0,1.2,2.9,1.0]");
 			for (const [index, fit] of fits.entries()) {
 				answers[`fit_${index}`] = {
 					type: "score",
@@ -312,6 +312,15 @@ if (process.argv.includes("--route")) {
 					probabilities: { cannot: 0, poorly: 0, adequately: 1 - fit / 4, well: fit / 4, expertly: 0 },
 				};
 			}
+			const lengthLevels = ["one answer and done", "one task, finished here", "a few steps with check-ins", "a multi-step piece of work", "a project over many turns"];
+			const lengthPick = Number(process.env.LENGTH_LEVEL ?? 3);
+			answers.length = {
+				type: "score",
+				score: lengthPick,
+				confidence: 0.9,
+				legend: {},
+				probabilities: Object.fromEntries(lengthLevels.map((label, index) => [label, index === lengthPick ? 0.9 : 0.025])),
+			};
 			answers.depth = {
 				type: "score",
 				score: 2,
@@ -336,7 +345,7 @@ if (process.argv.includes("--route")) {
 				usage: { input: 2000, output: outputTokens, cacheRead: 38000, cacheWrite: 0, totalTokens: 0, cost: {} },
 			},
 		];
-		for (const outputTokens of [4000, 8000]) {
+		for (const outputTokens of [800]) {
 			const started = Date.now();
 			const routed = await definition.route(
 				{ reason: "user", messages: transcript(outputTokens), previous: { model: opus, thinkingLevel: "medium" }, thinkingLevel: "medium" },

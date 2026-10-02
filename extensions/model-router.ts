@@ -57,6 +57,22 @@ type Level = (typeof ALL_LEVELS)[number];
 /** Five levels for "how well should this model handle the task, weighing price". */
 const FIT_LEVELS = ["cannot", "poorly", "adequately", "well", "expertly"];
 
+/**
+ * How much work the task is, from smallest to largest. These are magnitudes, not turn
+ * counts: "a multi-step piece of work" might be four turns or forty, and the point is
+ * only how many more turns the cache can be amortised over.
+ */
+const LENGTH_LEVELS = [
+	"one answer and done",
+	"one task, finished here",
+	"a few steps with check-ins",
+	"a multi-step piece of work",
+	"a project over many turns",
+];
+
+/** Turns to amortise a cache write over, per length level. Geometric on purpose. */
+const DEFAULT_HORIZON_BY_LEVEL = [1, 1, 2, 4, 8];
+
 interface Candidate {
 	label: string;
 	model: Model<any>;
@@ -81,8 +97,10 @@ interface Candidate {
 interface Scored {
 	candidate: Candidate;
 	level: Level;
-	/** Artificial Analysis dollars per task at this effort, or the catalog blend. */
+	/** What the tie-break compares: this turn's expected cost, or per-task cost. */
 	cost: number;
+	/** Artificial Analysis dollars per task at this effort, when measured. */
+	aaCost?: number;
 	fit: number;
 	/** Expected dollars for the upcoming turn with this pair's cache already warm. */
 	warmTurn: number;
@@ -181,7 +199,7 @@ function turnCost(candidate: Candidate, prefixTokens: number, outputTokens: numb
  * message actually used. That is a far better estimate than the length of the last user
  * message, and it is what a cache write would have to cover.
  */
-function turnSize(messages: readonly Message[], fallbackOutput: number): { prefixTokens: number; outputTokens: number } {
+function turnSize(messages: readonly Message[]): { prefixTokens: number; outputTokens?: number } {
 	let prefixTokens = 0;
 	const outputs: number[] = [];
 	for (const message of messages) {
@@ -197,7 +215,9 @@ function turnSize(messages: readonly Message[], fallbackOutput: number): { prefi
 		const chars = messages.reduce((sum, message) => sum + JSON.stringify(message.content ?? "").length, 0);
 		prefixTokens = Math.ceil(chars / 4);
 	}
-	const outputTokens = outputs.length ? outputs.reduce((a, b) => a + b, 0) / outputs.length : fallbackOutput;
+	// Undefined rather than a guess: the caller decides, since a longer piece of work
+	// deserves a longer answer than the flat default.
+	const outputTokens = outputs.length ? outputs.reduce((a, b) => a + b, 0) / outputs.length : undefined;
 	return { prefixTokens, outputTokens };
 }
 
@@ -291,7 +311,9 @@ export default function (pi: ExtensionAPI) {
 			const taskChars = numberOption(options, "taskChars", 16_000);
 			const tieMargin = numberOption(options, "tieMargin", 0.5);
 			const stick = options.stick !== false;
-			const horizon = numberOption(options, "horizon", 1);
+			// horizon 0 means "ask Jev how long the work is"; a number pins it instead.
+			const horizonSetting = numberOption(options, "horizon", 0);
+			const horizonByLevel = listOption(options, "horizonByLevel", DEFAULT_HORIZON_BY_LEVEL.map(String)).map(Number);
 			const downgradeMargin = numberOption(options, "downgradeMargin", 0.25);
 			// Capability gain overrides price: a clearly better model takes over even from a
 			// free one, since a cache write is cheap next to doing the work properly.
@@ -351,6 +373,12 @@ export default function (pi: ExtensionAPI) {
 						criteria: FIT_LEVELS,
 					};
 				}
+				questions.length = {
+					type: "score",
+					instructions:
+						"How much work is this, from the user's side? Judge the whole piece of work rather than this one message: whether it ends with an answer, a single task, or something that takes several steps and turns to get right.",
+					criteria: LENGTH_LEVELS,
+				};
 				questions.depth = {
 					type: "score",
 					instructions: hasAa
@@ -366,24 +394,40 @@ export default function (pi: ExtensionAPI) {
 				const depth = result.answers.depth;
 				const requested = depth?.type === "score" ? levelLabel(depth) : "off";
 
+				// How long the work is decides how many turns a cache write can be spread
+				// over, which is what the stickiness rule weighs. Level 0 and 1 both mean this
+				// turn is the whole thing, so the write can never pay for itself.
+				const lengthIndex = argmaxIndex(result.answers.length, LENGTH_LEVELS.length);
+				const horizon = horizonSetting > 0 ? horizonSetting : (horizonByLevel[lengthIndex] ?? 1);
+
 				// Highest fit wins; models within tieMargin of it are treated as tied and the
 				// cheapest of those takes it. Cost is what a task costs at the effort each
 				// model would run at, which is what lets a cheap model win a task that does
 				// not need a strong one.
-				const { prefixTokens, outputTokens } = turnSize(request.messages, defaultOutputTokens);
+				const { prefixTokens, outputTokens: measured } = turnSize(request.messages);
+				// With no transcript to learn from, a longer piece of work gets a longer
+				// first answer to divide by.
+				const outputTokens = measured ?? defaultOutputTokens * horizon;
 				const scored: Scored[] = candidates
 					.map((candidate, index) => {
 						const answer = result.answers[`fit_${index}`];
 						const level = nearestLevel(requested, candidate.levels);
-						// Measured cost at that effort, else the cheapest row the site has, else
-						// the catalog price for a model it knows nothing about.
-						const cost = costAtLevel(candidate.model, level, true, candidate.profile) ?? candidate.blended;
+						const warmTurn = turnCost(candidate, prefixTokens, outputTokens, true);
 						return {
 							candidate,
 							level,
-							cost,
+							// What the tie-break compares. Dollars per task and dollars per
+							// million tokens are not the same unit, so once any candidate has
+							// real rates the comparison uses this turn's expected cost at the
+							// effort the model would run at, which is the same arithmetic the
+							// stickiness rule uses. Artificial Analysis per-task cost is the
+							// fallback for when nothing is priced at all.
+							cost: priced
+								? warmTurn
+								: (costAtLevel(candidate.model, level, true, candidate.profile) ?? candidate.blended),
+							aaCost: costAtLevel(candidate.model, level, true, candidate.profile),
 							fit: answer?.type === "score" ? answer.score : -1,
-							warmTurn: turnCost(candidate, prefixTokens, outputTokens, true),
+							warmTurn,
 							coldTurn: turnCost(candidate, prefixTokens, outputTokens, false),
 						};
 					})
@@ -393,6 +437,21 @@ export default function (pi: ExtensionAPI) {
 				const contenders = scored.filter((entry) => entry.fit >= best - tieMargin);
 				const proposal = contenders.reduce((a, b) => (b.cost < a.cost ? b : a));
 				let chosen = proposal;
+				if (process.env.PI_JEV_ROUTER_DEBUG) {
+					console.error(
+						`jev router: length ${LENGTH_LEVELS[lengthIndex]} -> horizon ${horizon}, ` +
+							`turn ~${outputTokens} output tokens over a ${prefixTokens} token prompt. ` +
+							contenders
+								.map(
+									(entry) =>
+										`${entry.candidate.label}@${entry.level} fit ${entry.fit.toFixed(2)} ` +
+										(priced
+											? `$${entry.cost.toFixed(4)}/turn${entry.aaCost !== undefined ? ` ($${entry.aaCost.toFixed(2)}/task)` : ""}`
+											: `$${entry.cost.toFixed(2)}/task`),
+								)
+								.join(", "),
+					);
+				}
 
 				// Stickiness. Switching models means writing a fresh prompt cache, so a cheaper
 				// but weaker model only takes over if it saves more than that write over the
@@ -444,7 +503,8 @@ export default function (pi: ExtensionAPI) {
 					}
 					if (process.env.PI_JEV_ROUTER_DEBUG) {
 						console.error(
-							`jev router: proposed ${proposal.candidate.label}@${proposal.level} (fit ${proposal.fit.toFixed(2)}, ` +
+							`jev router: length ${LENGTH_LEVELS[lengthIndex]} -> horizon ${horizon}. ` +
+							`Proposed ${proposal.candidate.label}@${proposal.level} (fit ${proposal.fit.toFixed(2)}, ` +
 								`$${switchTotal.toFixed(4)} over ${horizon} turn(s)) against ${current.candidate.label}@${current.level} ` +
 								`(fit ${current.fit.toFixed(2)}, $${stayTotal.toFixed(4)} warm, $${writeCost.toFixed(4)} to write the cache). ` +
 								(stuck
@@ -463,6 +523,18 @@ export default function (pi: ExtensionAPI) {
 			}
 		},
 	});
+}
+
+/** Index of the most probable level, falling back to the mean when there is no spread. */
+function argmaxIndex(answer: { type: string; probabilities?: Record<string, number>; score?: number } | undefined, levels: number): number {
+	const entries = Object.entries(answer?.probabilities ?? {});
+	if (entries.length) {
+		const [label] = entries.reduce((a, b) => (b[1] > a[1] ? b : a));
+		const index = LENGTH_LEVELS.indexOf(label);
+		if (index >= 0) return index;
+	}
+	const mean = answer?.score ?? 0;
+	return Math.max(0, Math.min(levels - 1, Math.round(mean)));
 }
 
 /** The score answer's winning level, falling back to rounding its mean index. */

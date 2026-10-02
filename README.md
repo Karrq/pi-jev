@@ -323,8 +323,29 @@ $0.2/M cache read, $5/M cache write. A model with no counterpart anywhere stays 
 which is what a genuinely free model should cost. `PI_JEV_ROUTER_DEBUG=1` reports which
 rates were borrowed.
 
-`horizon` (1) is how many turns to amortise over. Larger values make the decision about
-per-turn cost alone, since the one-off write stops mattering; 1 keeps the write decisive.
+**How long the work is comes from Jev, not from a constant.** One more score asks how
+much work the task is, in magnitudes rather than turn counts: `one answer and done`,
+`one task, finished here`, `a few steps with check-ins`, `a multi-step piece of work`,
+`a project over many turns`. The winning level maps to an amortisation horizon through
+`horizonByLevel`, default `1, 1, 2, 4, 8`, so "this turn is the whole thing" gives 1 and
+the write can never pay for itself, while a project spreads it over eight. Setting
+`horizon` to a number pins it and skips the question.
+
+Gemma 4 separates those levels cleanly: a capital-of-France question scores 0.92 on a
+five-level scale, exploring a repo 2.22, researching an approach 2.67, designing a
+feature 2.93.
+
+The same proposal, the same 40k prompt and the same 800-token answer, differing only in
+the length estimate:
+
+| length | horizon | staying on Opus | switching to Haiku | |
+|---|---|---|---|---|
+| one answer and done | 1 | $0.024 | $0.054 | stay |
+| one task, finished here | 1 | $0.024 | $0.054 | stay |
+| a multi-step piece of work | 4 | $0.096 | $0.078 | switch |
+
+On a first turn there is no transcript to measure, so `expectedOutputTokens` (2000) is
+multiplied by the horizon, since longer work means a longer opening answer.
 
 **When nothing is priced at all.** If every candidate is genuinely free, so that no
 cache economics exist to compare, `zeroCostPolicy` decides:
@@ -340,7 +361,7 @@ provider, which on this machine is the free one.
 
 Settings: `fallback` (a `provider/id`), `candidates` (defaults to your enabled models),
 `profiles`, `thinkingLevels`, `maxCandidates`, `taskChars`, `tieMargin`, `stick`,
-`horizon`, `downgradeMargin`, `upgradeMargin`, `switchCostFactor`,
+`horizonByLevel`, `horizon`, `downgradeMargin`, `upgradeMargin`, `switchCostFactor`,
 `expectedOutputTokens`, `zeroCostPolicy`, `priceFrom`. Each routing decision is one request, 450-550ms locally. Set
 `PI_JEV_ROUTER_DEBUG=1` to have the router print each stickiness decision to stderr.
 
