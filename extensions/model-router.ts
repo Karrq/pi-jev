@@ -70,6 +70,8 @@ interface Candidate {
 	cacheWrite: number;
 	/** Weighted for an agentic turn: one input token is worth three output tokens. */
 	blended: number;
+	/** Set when the rates came from another provider's catalog rather than this model's. */
+	pricedFrom?: string;
 	note?: string;
 }
 
@@ -197,19 +199,37 @@ function turnSize(messages: readonly Message[], fallbackOutput: number): { prefi
 	return { prefixTokens, outputTokens };
 }
 
-function collect(ctx: ExtensionContext, labels: string[], notes: Record<string, string>, advertised: readonly Level[]): Candidate[] {
+function collect(
+	ctx: ExtensionContext,
+	labels: string[],
+	notes: Record<string, string>,
+	advertised: readonly Level[],
+	priceFrom: readonly string[],
+): Candidate[] {
 	const registry = ctx.modelRegistry;
 	const candidates: Candidate[] = [];
 	for (const label of labels) {
 		const slash = label.indexOf("/");
 		const model = registry.find(label.slice(0, slash), label.slice(slash + 1));
 		if (!model) continue;
-		const input = model.cost?.input ?? 0;
-		const output = model.cost?.output ?? 0;
+		const own = model.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+		// Subscription bridges and free routers publish no rates. Rather than treat those as
+		// genuinely free, borrow the catalog price of the same model id from a provider that
+		// does publish one, so cache writes still have to be paid for. Anything with no
+		// counterpart stays at zero, which is what a free model should cost.
+		const borrowed =
+			!own.input && !own.output
+				? priceFrom
+						.map((provider) => registry.find(provider, model.id)?.cost)
+						.find((cost): cost is NonNullable<typeof cost> => Boolean(cost?.input || cost?.output))
+				: undefined;
+		const rates = borrowed ?? own;
+		const input = rates.input ?? 0;
+		const output = rates.output ?? 0;
 		// Providers quote cache rates per million tokens; fall back to the usual 0.1x read
 		// and 1.25x write when a catalog omits them.
-		const cacheRead = model.cost?.cacheRead ?? input * 0.1;
-		const cacheWrite = model.cost?.cacheWrite ?? input * 1.25;
+		const cacheRead = rates.cacheRead ?? input * 0.1;
+		const cacheWrite = rates.cacheWrite ?? input * 1.25;
 		candidates.push({
 			label,
 			model,
@@ -219,10 +239,16 @@ function collect(ctx: ExtensionContext, labels: string[], notes: Record<string, 
 			cacheRead,
 			cacheWrite,
 			blended: input + 3 * output,
+			pricedFrom: borrowed ? `${priceFrom.find((provider) => registry.find(provider, model.id)?.cost === borrowed)} catalog` : undefined,
 			note: notes[label],
 		});
 	}
 	return candidates;
+}
+
+/** Where a candidate's rates came from, when they were borrowed from another catalog. */
+function rates(candidate: Candidate): string | undefined {
+	return candidate.pricedFrom ? `${candidate.label} from the ${candidate.pricedFrom}` : undefined;
 }
 
 /** `provider/id` for a model object, matching the labels candidates are keyed by. */
@@ -264,6 +290,9 @@ export default function (pi: ExtensionAPI) {
 			const stick = options.stick !== false;
 			const horizon = numberOption(options, "horizon", 1);
 			const downgradeMargin = numberOption(options, "downgradeMargin", 0.25);
+			// Capability gain overrides price: a clearly better model takes over even from a
+			// free one, since a cache write is cheap next to doing the work properly.
+			const upgradeMargin = numberOption(options, "upgradeMargin", 0.25);
 			const switchCostFactor = numberOption(options, "switchCostFactor", 1);
 			const defaultOutputTokens = numberOption(options, "expectedOutputTokens", 2_000);
 			// What to do when the catalog prices every candidate at zero, which is the case
@@ -276,7 +305,8 @@ export default function (pi: ExtensionAPI) {
 			const enabled = enabledLabels(ctx).filter((label) => label !== `${VIRTUAL_PROVIDER}/${VIRTUAL_ID}`);
 			const configured = listOption(options, "candidates", []);
 			const labels = (configured.length ? configured : enabled).slice(0, maxCandidates);
-			const candidates = collect(ctx, labels, profiles, advertised);
+			const priceFrom = listOption(options, "priceFrom", ["anthropic"]);
+			const candidates = collect(ctx, labels, profiles, advertised, priceFrom);
 			if (candidates.length === 0) {
 				throw new Error(
 					`jev-model-router: no candidate models. Set overrides["${EXTENSION}"].candidates or enable models with credentials.`,
@@ -372,9 +402,10 @@ export default function (pi: ExtensionAPI) {
 					// No prices anywhere: a cache write cannot be weighed against a saving.
 					// "stick" keeps the warm pair, "aa" compares the Artificial Analysis cost
 					// per task instead and only moves for a real saving.
+					const upgrade = chosen.fit >= current.fit + upgradeMargin;
 					const aaCheaper = zeroCostPolicy === "aa" && chosen.cost < current.cost;
 					const smallEnough = current.fit - chosen.fit <= downgradeMargin;
-					if (!aaCheaper || !smallEnough) {
+					if (!upgrade && (!aaCheaper || !smallEnough)) {
 						chosen = current;
 						stuck = true;
 					}
@@ -384,7 +415,9 @@ export default function (pi: ExtensionAPI) {
 								`${proposal.candidate.label}@${proposal.level} (fit ${proposal.fit.toFixed(2)}, ` +
 								`$${proposal.cost.toFixed(2)}/task) against ${current.candidate.label}@${current.level} ` +
 								`(fit ${current.fit.toFixed(2)}, $${current.cost.toFixed(2)}/task). ` +
-								(stuck ? `Staying on ${current.candidate.label}.` : `Switching to ${proposal.candidate.label}.`),
+								(stuck
+									? `Staying on ${current.candidate.label}.`
+									: `Switching to ${proposal.candidate.label}${upgrade ? " on capability" : ""}.`),
 						);
 					}
 				} else if (stick && priced && current && chosen !== current) {
@@ -400,8 +433,9 @@ export default function (pi: ExtensionAPI) {
 					// is the guard rail: a model that is meaningfully worse for this task stays put
 					// however much it saves.
 					const downgrade = current.fit - chosen.fit;
+					const upgrade = -downgrade >= upgradeMargin;
 					const smallEnough = downgrade <= downgradeMargin;
-					if (!cheaperOverall || !smallEnough) {
+					if (!upgrade && (!cheaperOverall || !smallEnough)) {
 						chosen = current;
 						stuck = true;
 					}
@@ -410,7 +444,12 @@ export default function (pi: ExtensionAPI) {
 							`jev router: proposed ${proposal.candidate.label}@${proposal.level} (fit ${proposal.fit.toFixed(2)}, ` +
 								`$${switchTotal.toFixed(4)} over ${horizon} turn(s)) against ${current.candidate.label}@${current.level} ` +
 								`(fit ${current.fit.toFixed(2)}, $${stayTotal.toFixed(4)} warm, $${writeCost.toFixed(4)} to write the cache). ` +
-								(stuck ? `Staying on ${current.candidate.label}.` : `Switching to ${proposal.candidate.label}.`),
+								(stuck
+									? `Staying on ${current.candidate.label}.`
+									: `Switching to ${proposal.candidate.label}${upgrade ? " on capability" : ""}.`) +
+								(rates(current.candidate) || rates(proposal.candidate)
+									? ` Borrowed rates: ${[rates(current.candidate), rates(proposal.candidate)].filter(Boolean).join(" and ")}.`
+									: ""),
 						);
 					}
 				}

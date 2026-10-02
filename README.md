@@ -278,12 +278,25 @@ Switching is also refused when the proposal is more than `downgradeMargin` (0.25
 of the tie margin) behind on fit. Capability is not priced here, so that is the guard
 rail: a meaningfully worse model stays put however much it saves.
 
+The rule is one-sided. A proposal `upgradeMargin` (0.25) or more ahead on fit switches
+regardless of price, because a cache write is cheap next to doing the work properly.
+Without that, a free model with a warm cache would be a trap: staying on it costs
+nothing, so no priced model could ever take over.
+
+**Prices are borrowed where a provider publishes none.** Subscription bridges report
+every rate as zero, and a zero cache write makes switching look free, which is the
+opposite of the truth. When a candidate's own catalog has no rates at all, the router
+takes the same model id from `priceFrom` (default `["anthropic"]`) and uses those, so
+pi's own rates apply to your Opus, Sonnet and Haiku entries: Opus at $4/M in, $20/M out,
+$0.2/M cache read, $5/M cache write. A model with no counterpart anywhere stays at zero,
+which is what a genuinely free model should cost. `PI_JEV_ROUTER_DEBUG=1` reports which
+rates were borrowed.
+
 `horizon` (1) is how many turns to amortise over. Larger values make the decision about
 per-turn cost alone, since the one-off write stops mattering; 1 keeps the write decisive.
 
-**When nothing is priced.** Subscription bridges and free routers report every rate as
-zero in pi's catalog, which is the case for every model on this machine. There are no
-cache economics to compare, so `zeroCostPolicy` decides:
+**When nothing is priced at all.** If every candidate is genuinely free, so that no
+cache economics exist to compare, `zeroCostPolicy` decides:
 
 | policy | behaviour |
 |---|---|
@@ -291,10 +304,13 @@ cache economics to compare, so `zeroCostPolicy` decides:
 | `aa` | Compare Artificial Analysis cost per task instead, and switch only for a real saving. |
 | `switch` | No stickiness at all; every turn routes on fit. |
 
+With borrowed rates this only applies to models with no counterpart in any `priceFrom`
+provider, which on this machine is the free one.
+
 Settings: `fallback` (a `provider/id`), `candidates` (defaults to your enabled models),
 `profiles`, `thinkingLevels`, `maxCandidates`, `taskChars`, `tieMargin`, `stick`,
-`horizon`, `downgradeMargin`, `switchCostFactor`, `expectedOutputTokens`,
-`zeroCostPolicy`. Each routing decision is one request, 450-550ms locally. Set
+`horizon`, `downgradeMargin`, `upgradeMargin`, `switchCostFactor`,
+`expectedOutputTokens`, `zeroCostPolicy`, `priceFrom`. Each routing decision is one request, 450-550ms locally. Set
 `PI_JEV_ROUTER_DEBUG=1` to have the router print each stickiness decision to stderr.
 
 ```json

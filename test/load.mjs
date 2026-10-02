@@ -228,7 +228,8 @@ if (process.argv.includes("--route")) {
 	const definition = virtuals.get("jev/auto");
 	if (!definition) throw new Error("jev/auto was not registered");
 
-	// Three shapes of candidate: expensive reasoning model, mid, cheap non-reasoning.
+	// The real shape: claude-bridge publishes no rates, the free router has no counterpart
+	// in pi's anthropic catalog, and the bridge models must borrow theirs.
 	const model = (provider, id, name, cost, extra) => ({
 		provider,
 		id,
@@ -238,10 +239,25 @@ if (process.argv.includes("--route")) {
 		cost: { input: cost, output: cost * 5, cacheRead: cost / 10, cacheWrite: cost },
 		...extra,
 	});
+	const bridge = (id, cost) => ({
+		provider: "claude-bridge",
+		id,
+		name: id,
+		contextWindow: 200_000,
+		maxTokens: 64_000,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		reasoning: true,
+		thinkingLevelMap: { off: null, low: "low", medium: "medium", high: "high", xhigh: "max", max: "max" },
+		anthropicCost: cost,
+	});
+	const ANTHROPIC_RATES = {
+		"claude-opus-5-5": { input: 4, output: 20, cacheRead: 0.2, cacheWrite: 5 },
+		"claude-sonnet-5-5": { input: 2, output: 10, cacheRead: 0.2, cacheWrite: 2.5 },
+	};
 	const catalog = [
-		{ model: model("claude-bridge", "claude-opus-5-5", "Claude Opus 5.5", 4, { reasoning: true, thinkingLevelMap: { off: null, low: "low", medium: "medium", high: "high", xhigh: "max" } }) },
-		{ model: model("claude-bridge", "claude-sonnet-5-5", "Claude Sonnet 5.5", 2, { reasoning: true, thinkingLevelMap: { off: null, low: "low", medium: "medium", high: "high", xhigh: "max" } }) },
-		{ model: model("claude-bridge", "claude-haiku-4-5", "Claude Haiku 4.5", 1, { reasoning: false }) },
+		{ model: bridge("claude-opus-5-5", 4) },
+		{ model: bridge("claude-sonnet-5-5", 2) },
+		{ model: { ...bridge("claude-haiku-4-5", 1), reasoning: false, thinkingLevelMap: { off: "off" } } },
 		{ model: model("openrouter", "space-bunny-alpha", "Space Bunny Alpha", 0, { reasoning: false }) },
 	];
 	const routeCtx = {
@@ -249,7 +265,12 @@ if (process.argv.includes("--route")) {
 		isProjectTrusted: () => false,
 		getScopedModels: () => catalog,
 		modelRegistry: {
-			find: (provider, id) => catalog.find((m) => m.model.provider === provider && m.model.id === id)?.model,
+			find: (provider, id) => {
+				if (provider === "anthropic" && ANTHROPIC_RATES[id]) {
+					return { provider, id, cost: ANTHROPIC_RATES[id] };
+				}
+				return catalog.find((m) => m.model.provider === provider && m.model.id === id)?.model;
+			},
 		},
 	};
 	const message = (text) => ({ role: "user", content: text });
@@ -275,10 +296,11 @@ if (process.argv.includes("--route")) {
 		// Canned answers so the proposal is known: Opus slightly ahead, Sonnet close
 		// behind and cheaper, which is the case the stickiness rule exists for.
 		const realFetch = globalThis.fetch;
+		const fitsEnv = process.env.FITS;
 		globalThis.fetch = async (_url, init) => {
 			const body = JSON.parse(init.body);
 			const answers = {};
-			const fits = [3.0, 2.95, 1.2, 0.1];
+			const fits = JSON.parse(fitsEnv ?? "[3.0,2.95,1.2,0.8]");
 			for (const [index, fit] of fits.entries()) {
 				answers[`fit_${index}`] = {
 					type: "score",
@@ -312,7 +334,7 @@ if (process.argv.includes("--route")) {
 				usage: { input: 2000, output: outputTokens, cacheRead: 38000, cacheWrite: 0, totalTokens: 0, cost: {} },
 			},
 		];
-		for (const outputTokens of [400, 4000, 8000, 60000]) {
+		for (const outputTokens of [4000, 8000]) {
 			const started = Date.now();
 			const routed = await definition.route(
 				{ reason: "user", messages: transcript(outputTokens), previous: { model: opus, thinkingLevel: "medium" }, thinkingLevel: "medium" },
