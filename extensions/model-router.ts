@@ -40,10 +40,10 @@
 
 import type { Message, Model } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext, ModelRoute, ModelRouteRequest } from "@earendil-works/pi-coding-agent";
-import { costAtLevel, effortLines } from "../src/aa.ts";
+import { costAtLevel, effortLines, type ManualProfile } from "../src/aa.ts";
 import { readAgentSettings, resolve } from "../src/config.ts";
 import { systemOne } from "../src/client.ts";
-import { listOption, numberOption, objectOption, stringOption } from "../src/shared.ts";
+import { listOption, numberOption, profilesOption, stringOption } from "../src/shared.ts";
 
 const EXTENSION = "jev-model-router";
 
@@ -73,6 +73,8 @@ interface Candidate {
 	/** Set when the rates came from another provider's catalog rather than this model's. */
 	pricedFrom?: string;
 	note?: string;
+	/** Hand-written scores and notes from `profiles`, if any. */
+	profile?: ManualProfile;
 }
 
 /** One scored candidate: the model, the effort it would run at, and what that costs. */
@@ -105,7 +107,7 @@ function levelsOf(model: Model<any>, advertised: readonly Level[]): Level[] {
 
 function describe(candidate: Candidate, index: number): string {
 	const lines = [`[${index}] ${candidate.label}`];
-	const efforts = effortLines(candidate.model);
+	const efforts = effortLines(candidate.model, candidate.profile);
 	if (efforts) {
 		lines.push("    Artificial Analysis Intelligence Index and cost per task, by reasoning effort:");
 		lines.push(...efforts);
@@ -202,7 +204,7 @@ function turnSize(messages: readonly Message[], fallbackOutput: number): { prefi
 function collect(
 	ctx: ExtensionContext,
 	labels: string[],
-	notes: Record<string, string>,
+	profiles: Record<string, ManualProfile>,
 	advertised: readonly Level[],
 	priceFrom: readonly string[],
 ): Candidate[] {
@@ -239,8 +241,9 @@ function collect(
 			cacheRead,
 			cacheWrite,
 			blended: input + 3 * output,
+			profile: profiles[label],
 			pricedFrom: borrowed ? `${priceFrom.find((provider) => registry.find(provider, model.id)?.cost === borrowed)} catalog` : undefined,
-			note: notes[label],
+			note: profiles[label]?.notes,
 		});
 	}
 	return candidates;
@@ -283,7 +286,7 @@ export default function (pi: ExtensionAPI) {
 			const { options } = resolve(ctx.cwd ?? process.cwd(), EXTENSION, ctx.isProjectTrusted());
 			const fallbackLabel = stringOption(options, "fallback", "");
 			const advertised = listOption(options, "thinkingLevels", DEFAULT_LEVELS) as Level[];
-			const profiles = objectOption(options, "profiles", {}) as Record<string, string>;
+			const profiles = profilesOption(options, "profiles");
 			const maxCandidates = numberOption(options, "maxCandidates", 24);
 			const taskChars = numberOption(options, "taskChars", 16_000);
 			const tieMargin = numberOption(options, "tieMargin", 0.5);
@@ -336,7 +339,7 @@ export default function (pi: ExtensionAPI) {
 			const depthLevels = advertised.filter((level) => candidates.some((candidate) => candidate.levels.includes(level)));
 			const depthCriteria = depthLevels.length ? depthLevels : (["off"] as Level[]);
 
-			const hasAa = candidates.some((candidate) => effortLines(candidate.model) !== undefined);
+			const hasAa = candidates.some((candidate) => effortLines(candidate.model, candidate.profile) !== undefined);
 			try {
 				const { endpoint } = resolve(ctx.cwd ?? process.cwd(), EXTENSION, ctx.isProjectTrusted());
 				const questions: Record<string, any> = {};
@@ -374,7 +377,7 @@ export default function (pi: ExtensionAPI) {
 						const level = nearestLevel(requested, candidate.levels);
 						// Measured cost at that effort, else the cheapest row the site has, else
 						// the catalog price for a model it knows nothing about.
-						const cost = costAtLevel(candidate.model, level, true) ?? candidate.blended;
+						const cost = costAtLevel(candidate.model, level, true, candidate.profile) ?? candidate.blended;
 						return {
 							candidate,
 							level,

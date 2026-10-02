@@ -214,8 +214,39 @@ decision.
       max      index 58, $5.98/task
 ```
 
-`notes` in `profiles` is still there for anything the numbers do not say, and is passed
-through verbatim.
+`profiles` is where anything the numbers do not say goes, and for models Artificial
+Analysis has not measured it is also where scores go. A profile is either a note as a
+string, or an object:
+
+```json
+"profiles": {
+  "openrouter/stealth/space-bunny-alpha": {
+    "notes": "minimax-m3.1, unreleased, free. Code quality on par with DeepSeek V4 Flash (AA 34), just under GLM 5.3 Flash (AA 42), below both otherwise.",
+    "index": 37,
+    "costPerTask": 0
+  }
+}
+```
+
+That renders as a row like any measured one, marked so nobody mistakes it for data:
+
+```
+[3] openrouter/space-bunny-alpha
+    Artificial Analysis Intelligence Index and cost per task, by reasoning effort:
+      default  index ~37, $0.00/task (your estimate)
+    notes: minimax-m3.1, unreleased, free. ...
+```
+
+`byEffort` gives per-level scores (`{ low: { index: 30 }, high: { index: 44 } }`) for
+models that do have effort settings. Scores you write replace the fetched rows for that
+model, since a number you chose on purpose should not be silently overwritten by the
+next fetch; delete the field to go back to the site's numbers.
+
+It matters more than it looks. With no profile at all, that model scored 0.12 on
+"rename a variable across 40 files", out of five levels, which is not a judgement but a
+guess from an unfamiliar name. With the note and an index of 37 it scored 2.47, and on
+"what is the capital of France?" it scored 3.27, the highest of the four, which is what
+put a trivial task on the free model.
 
 Refresh the file by hand when you want new numbers:
 

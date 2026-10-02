@@ -44,18 +44,31 @@ export function stringOption(options: Record<string, unknown>, key: string, fall
 	return typeof value === "string" && value ? value : fallback;
 }
 
+import type { ManualProfile } from "./aa.ts";
+
 /** Read a string-array option with a default. */
 export function listOption(options: Record<string, unknown>, key: string, fallback: string[]): string[] {
 	const value = options[key];
 	return Array.isArray(value) && value.every((v) => typeof v === "string") ? (value as string[]) : fallback;
 }
 
-/** Read a nested object of strings, e.g. `profiles: { "provider/id": "note" }`. */
-export function objectOption(options: Record<string, unknown>, key: string, fallback: Record<string, string>): Record<string, string> {
+/**
+ * Read model profiles: `"provider/id": "a note"` or
+ * `"provider/id": { notes, index, costPerTask, byEffort }`. The string form is the
+ * same as `{ notes }`, so a note written before scores existed keeps working.
+ */
+export function profilesOption(
+	options: Record<string, unknown>,
+	key: string,
+): Record<string, ManualProfile> {
 	const value = options[key];
-	if (!value || typeof value !== "object" || Array.isArray(value)) return fallback;
-	const entries = Object.entries(value as Record<string, unknown>).filter(([, v]) => typeof v === "string");
-	return entries.length ? Object.fromEntries(entries) as Record<string, string> : fallback;
+	if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+	const out: Record<string, ManualProfile> = {};
+	for (const [label, entry] of Object.entries(value as Record<string, unknown>)) {
+		if (typeof entry === "string" && entry.trim()) out[label] = { notes: entry.trim() };
+		else if (entry && typeof entry === "object" && !Array.isArray(entry)) out[label] = entry as ManualProfile;
+	}
+	return out;
 }
 
 export function text(content: string): { content: [{ type: "text"; text: string }] } {

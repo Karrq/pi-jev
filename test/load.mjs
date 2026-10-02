@@ -253,6 +253,7 @@ if (process.argv.includes("--route")) {
 	const ANTHROPIC_RATES = {
 		"claude-opus-5-5": { input: 4, output: 20, cacheRead: 0.2, cacheWrite: 5 },
 		"claude-sonnet-5-5": { input: 2, output: 10, cacheRead: 0.2, cacheWrite: 2.5 },
+		"claude-haiku-4-5": { input: 1, output: 5, cacheRead: 0.1, cacheWrite: 1.25 },
 	};
 	const catalog = [
 		{ model: bridge("claude-opus-5-5", 4) },
@@ -262,7 +263,8 @@ if (process.argv.includes("--route")) {
 	];
 	const routeCtx = {
 		cwd: root,
-		isProjectTrusted: () => false,
+		isProjectTrusted: () => process.env.TRUSTED === "1",
+		settingsOverride: { profiles: { "openrouter/space-bunny-alpha": { notes: "minimax-m3.1, unreleased, free. Code quality on par with DeepSeek V4 Flash (AA 34), just under GLM 5.3 Flash (AA 42), below both otherwise.", index: 37, costPerTask: 0 } } },
 		getScopedModels: () => catalog,
 		modelRegistry: {
 			find: (provider, id) => {
