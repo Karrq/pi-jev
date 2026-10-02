@@ -356,6 +356,51 @@ if (process.argv.includes("--route")) {
 		globalThis.fetch = realFetch;
 	}
 
+	// A session with history: the state should carry the precedent, so Jev can tell a
+	// follow-up to a small task from a new piece of work.
+	if (process.env.SHOW_HISTORY) {
+		const assistant = (model, output, id) => ({
+			role: "assistant",
+			provider: "claude-bridge",
+			model: "claude-sonnet-5-5",
+			content: [{ type: "text", text: `answer ${id ?? ""}`.trim() }],
+			usage: {
+				input: 2000,
+				output,
+				cacheRead: 38000,
+				cacheWrite: 0,
+				totalTokens: 40000 + output,
+				// claude-bridge reports no cost, so the router has to price it from borrowed rates.
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+		});
+		const messages = [
+			{ role: "user", content: "what is the capital of France?" },
+			assistant("claude-sonnet-5-5", 60, 1),
+			{ role: "user", content: "now rename that variable across the 40 files that use it" },
+			assistant("claude-sonnet-5-5", 900, 2),
+			assistant("claude-sonnet-5-5", 1400, 3),
+			assistant("claude-sonnet-5-5", 2200, 4),
+			{ role: "user", content: "also check the tests still pass" },
+		];
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = async (url, init) => {
+			const body = JSON.parse(init.body);
+			console.log(body.state.split("\n").slice(0, 8).join("\n"));
+			const response = await realFetch(url, init);
+			const answers = (await response.clone().json()).answers;
+			for (const [id, answer] of Object.entries(answers)) {
+				const top = Object.entries(answer.probabilities ?? {}).sort((a, b) => b[1] - a[1])[0];
+				console.log(`   ${id.padEnd(7)} ${top ? `${top[0]} ${(top[1] * 100).toFixed(0)}%` : answer.score?.toFixed(2)}`);
+			}
+			return response;
+		};
+		const started = Date.now();
+		const routed = await definition.route({ reason: "user", messages, previous: { model: catalog[1].model, thinkingLevel: "medium" }, thinkingLevel: "medium" }, routeCtx);
+		globalThis.fetch = realFetch;
+		console.log(`history 3 prompts -> ${routed.model.id} @ ${routed.thinkingLevel} (${Date.now() - started}ms)`);
+	}
+
 	if (process.env.SHOW_STATE) {
 		// Print the state the router builds, including the Artificial Analysis block.
 		const seen = [];
@@ -363,6 +408,10 @@ if (process.argv.includes("--route")) {
 		globalThis.fetch = async (url, init) => {
 			const body = JSON.parse(init.body);
 			seen.push(body.state);
+			if (process.env.SHOW_HISTORY) {
+				const history = body.state.split("\n").slice(0, 6).join("\n");
+				console.log(history);
+			}
 			console.log(`   task: ${body.state.split("\n")[1]}`);
 			const response = await originalFetch(url, init);
 			const answers = (await response.clone().json()).answers;

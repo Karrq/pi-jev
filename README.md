@@ -335,6 +335,32 @@ Gemma 4 separates those levels cleanly: a capital-of-France question scores 0.92
 five-level scale, exploring a repo 2.22, researching an approach 2.67, designing a
 feature 2.93.
 
+**Earlier prompts in the session are handed over as precedent.** The length question
+guesses how big a piece of work is; a measured precedent does not. Each completed prompt
+in the session is listed with the turns it took, the models that took them, what it cost
+and how many tokens came back:
+
+```
+Task:
+also check the tests still pass
+
+Earlier prompts in this session, and what answering them actually took:
+  "what is the capital of France?" took 1 turn on claude-bridge/claude-sonnet-5-5, $0.013 estimated and 60 output tokens
+  "now rename that variable across the 40 files that use it" took 3 turns on claude-bridge/claude-sonnet-5-5, $0.083 estimated and 4500 output tokens
+
+Candidate models:
+...
+```
+
+That follow-up, with only the three-turn precedent visible, scored length 3, a
+multi-step piece of work. With the trivial question above it in the list, the same
+prompt scored length 1, one task finished here. `historyPrompts` (3) is how many are
+shown and `historyChars` (240) truncates each.
+
+Costs are marked `estimated` when the provider reports none, which is every model here:
+the router prices those tokens with the same borrowed rates it uses for switching, so
+$0.083 is 4500 output tokens plus the cached prompt at Sonnet's rates.
+
 The same proposal, the same 40k prompt and the same 800-token answer, differing only in
 the length estimate:
 
@@ -362,7 +388,8 @@ provider, which on this machine is the free one.
 Settings: `fallback` (a `provider/id`), `candidates` (defaults to your enabled models),
 `profiles`, `thinkingLevels`, `maxCandidates`, `taskChars`, `tieMargin`, `stick`,
 `horizonByLevel`, `horizon`, `downgradeMargin`, `upgradeMargin`, `switchCostFactor`,
-`expectedOutputTokens`, `zeroCostPolicy`, `priceFrom`. Each routing decision is one request, 450-550ms locally. Set
+`expectedOutputTokens`, `historyPrompts`, `historyChars`, `zeroCostPolicy`,
+`priceFrom`. Each routing decision is one request, 450-550ms locally. Set
 `PI_JEV_ROUTER_DEBUG=1` to have the router print each stickiness decision to stderr.
 
 ```json

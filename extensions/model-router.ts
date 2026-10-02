@@ -194,6 +194,82 @@ function turnCost(candidate: Candidate, prefixTokens: number, outputTokens: numb
 	return input + output;
 }
 
+/** One completed user prompt in this session, and what answering it actually took. */
+interface TurnRecord {
+	prompt: string;
+	turns: number;
+	models: string[];
+	outputTokens: number;
+	/** Dollars for those turns, from reported usage or from borrowed rates. */
+	cost: number;
+	estimated: boolean;
+}
+
+/**
+ * What earlier prompts in this session cost in turns, models and dollars.
+ *
+ * The length question guesses how big a piece of work is. A precedent does not guess:
+ * "what is the capital of France?" took one turn and 40 dollars of cents, so a short
+ * follow-up to it is a small task, and a prompt like the multi-step one that took nine
+ * turns is not. Only completed prompts appear, so the current turn is never listed.
+ */
+function sessionHistory(
+	messages: readonly Message[],
+	candidates: readonly Candidate[],
+	prompts: number,
+	promptChars: number,
+): TurnRecord[] {
+	const rateFor = new Map(candidates.map((candidate) => [candidate.label, candidate]));
+	const records: TurnRecord[] = [];
+	let current: TurnRecord | undefined;
+	for (const message of messages) {
+		if (message.role === "user") {
+			current = { prompt: lastUserText([message]).trim(), turns: 0, models: [], outputTokens: 0, cost: 0, estimated: false };
+			records.push(current);
+			continue;
+		}
+		if (message.role !== "assistant" || !current) continue;
+		const usage = (message as { usage?: { output?: number; cost?: { total?: number } } }).usage;
+		if (!usage) continue;
+		current.turns += 1;
+		current.outputTokens += usage.output ?? 0;
+		const model = `${(message as { provider?: string }).provider ?? "?"}/${(message as { model?: string }).model ?? "?"}`;
+		if (!current.models.includes(model)) current.models.push(model);
+		const reported = usage.cost?.total ?? 0;
+		if (reported > 0) {
+			current.cost += reported;
+		} else {
+			// Bridges and free routers report no cost. Price those tokens with whatever
+			// rates this candidate borrowed, so the precedent still has a number.
+			const rates = rateFor.get(model) ?? rateFor.get(`${(message as any).provider}/${(message as any).model}`);
+			if (rates) {
+				const input = (usage as any).input ?? 0;
+				const read = (usage as any).cacheRead ?? 0;
+				const write = (usage as any).cacheWrite ?? 0;
+				current.cost +=
+					((input + write) / 1_000_000) * rates.cacheWrite +
+					(read / 1_000_000) * rates.cacheRead +
+					(usage.output ?? 0) / 1_000_000 * rates.output;
+				current.estimated = true;
+			}
+		}
+	}
+	return records.filter((record) => record.turns > 0).slice(-prompts);
+}
+
+function historyLines(records: readonly TurnRecord[], promptChars: number): string[] {
+	if (!records.length) return [];
+	const lines = records.map((record) => {
+		const prompt = record.prompt.length > promptChars ? `${record.prompt.slice(0, promptChars)}...` : record.prompt;
+		const dollars = `$${record.cost < 0.01 ? record.cost.toFixed(4) : record.cost.toFixed(3)}${record.estimated ? " estimated" : ""}`;
+		return (
+			`  "${prompt}" took ${record.turns} turn${record.turns === 1 ? "" : "s"} on ` +
+			`${record.models.join(", ")}, ${dollars} and ${Math.round(record.outputTokens)} output tokens`
+		);
+	});
+	return ["Earlier prompts in this session, and what answering them actually took:", ...lines, ""];
+}
+
 /**
  * Prompt size and expected answer size for the next turn, from what the last assistant
  * message actually used. That is a far better estimate than the length of the last user
@@ -320,6 +396,11 @@ export default function (pi: ExtensionAPI) {
 			const upgradeMargin = numberOption(options, "upgradeMargin", 0.25);
 			const switchCostFactor = numberOption(options, "switchCostFactor", 1);
 			const defaultOutputTokens = numberOption(options, "expectedOutputTokens", 2_000);
+			// 3 rather than 1: with only the most recent precedent a short follow-up to a
+			// three-turn task still read as multi-step, while showing the trivial question
+			// answered in one turn alongside it dropped the same follow-up to one task.
+			const historyPrompts = numberOption(options, "historyPrompts", 3);
+			const historyChars = numberOption(options, "historyChars", 240);
 			// What to do when the catalog prices every candidate at zero, which is the case
 			// for subscription bridges and free routers: there are no cache economics to
 			// compare, so the policy decides whether fit alone moves the model.
@@ -354,7 +435,11 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			const task = lastUserText(request.messages).slice(0, taskChars);
-			const state = [`Task:\n${task}`, "", "Candidate models:", ...candidates.map(describe)].join("\n");
+			const history = historyLines(
+				sessionHistory(request.messages, candidates, historyPrompts, historyChars),
+				historyChars,
+			);
+			const state = [`Task:\n${task}`, "", ...history, "Candidate models:", ...candidates.map(describe)].join("\n");
 			// Depth is asked on the levels `jev/auto` advertises and then narrowed by name
 			// to the winner's own levels. Intersecting them here instead would collapse the
 			// question to "off" as soon as one candidate cannot think.
@@ -376,7 +461,7 @@ export default function (pi: ExtensionAPI) {
 				questions.length = {
 					type: "score",
 					instructions:
-						"How much work is this, from the user's side? Judge the whole piece of work rather than this one message: whether it ends with an answer, a single task, or something that takes several steps and turns to get right.",
+						"How much work is this, from the user's side? Judge the whole piece of work rather than this one message: whether it ends with an answer, a single task, or something that takes several steps and turns to get right. Any earlier prompt listed with the turns it took is a precedent: a follow-up to a small piece of work is small, and a prompt like one that took many turns is not.",
 					criteria: LENGTH_LEVELS,
 				};
 				questions.depth = {
