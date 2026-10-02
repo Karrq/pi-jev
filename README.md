@@ -388,8 +388,8 @@ provider, which on this machine is the free one.
 Settings: `fallback` (a `provider/id`), `candidates` (defaults to your enabled models),
 `profiles`, `thinkingLevels`, `maxCandidates`, `taskChars`, `tieMargin`, `stick`,
 `horizonByLevel`, `horizon`, `downgradeMargin`, `upgradeMargin`, `switchCostFactor`,
-`expectedOutputTokens`, `historyPrompts`, `historyChars`, `zeroCostPolicy`,
-`priceFrom`. Each routing decision is one request, 450-550ms locally. Set
+`expectedOutputTokens`, `historyPrompts`, `historyChars`, `record`, `notify`,
+`zeroCostPolicy`, `priceFrom`. Each routing decision is one request, 450-550ms locally. Set
 `PI_JEV_ROUTER_DEBUG=1` to have the router print each stickiness decision to stderr.
 
 ```json
@@ -427,6 +427,46 @@ reasoning" dropped one model from 2.88 to 1.42 on a rename that was never multi-
 Criteria are plain strings; a choice criterion may carry its own text as
 `"label: description"`.
 
+## Reading the decisions back
+
+Every routing decision is written to the session as a custom entry of type
+`jev-model-router.decision`, holding the task, the precedents, Jev's length and depth
+answers, every candidate with its fit, level and costs, the raw answers with their
+distributions, and the outcome with the reason. Data-only custom entries are not sent to
+the model, so this costs no context:
+
+```json
+{
+  "at": "2026-10-02T14:23:42.293Z",
+  "task": "also check the tests still pass",
+  "length": { "level": "a few steps with check-ins", "score": 1.647, "horizon": 2 },
+  "depth":  { "level": "low", "score": 1.813 },
+  "turn":   { "promptTokens": 40000, "outputTokens": 1140 },
+  "candidates": [
+    { "label": "claude-bridge/claude-sonnet-5-5", "level": "low", "fit": 2.799,
+      "aaCostPerTask": 0.59, "costBasis": 0.0194, "warmTurn": 0.0194, "coldTurn": 0.1114,
+      "ratesFrom": "anthropic catalog" }
+  ],
+  "decided": { "model": "claude-bridge/claude-sonnet-5-5", "level": "low",
+               "why": "Jev's proposal won outright" },
+  "answers": { "fit_0": { "type": "score", "score": 2.688, "probabilities": { "0": 0, ... } } }
+}
+```
+
+Continuations, retries, `direct` requests and routing failures are recorded too, with
+their reason and no candidates. When the model actually changes, the same summary is
+sent as an ephemeral notification. `record: false` and `notify: false` turn either off.
+
+To read them back:
+
+```
+jq -c 'select(.customType=="jev-model-router.decision") | {task, decided}' ~/.pi/agent/sessions/<session>.jsonl
+```
+
+`PI_JEV_ROUTER_DEBUG=1` still prints the arithmetic live, including every contender's fit
+and turn cost, and is the quicker tool when you are watching a live session rather than
+reading it back.
+
 ## Gotchas
 
 - Pi's `ExtensionContext` declares `getScopedModels()`, and at runtime in 0.99.2 that
@@ -437,6 +477,11 @@ Criteria are plain strings; a choice criterion may carry its own text as
   if a future version adds it, and finally to the `enabledModels` patterns in settings.
 - A `route()` context is created per request and goes stale after a session
   replacement, so do not capture one.
+- Endpoints disagree on what a score answer's probability keys are. open-jev keys them
+  by criterion index and puts the labels in `legend`; the hosted API keys them by label.
+  Reading a key as a label made every depth answer come back as a number, which silently
+  pinned the depth choice to the lowest level a model supported. Both shapes are accepted
+  now, checked against the criteria that were sent.
 
 ## Caveats
 

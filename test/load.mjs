@@ -23,6 +23,8 @@ const alias = { typebox: piRequire.resolve("typebox") };
 const jiti = createJiti(import.meta.url, { interopDefault: true, alias });
 
 const schemaMode = process.argv.includes("--schema");
+const recorded = [];
+const notified = [];
 const registered = { tools: [], commands: [], events: [], virtualModels: [], schema: [] };
 const tools = new Map();
 const stub = {
@@ -60,13 +62,15 @@ const ctx = {
 	isProjectTrusted: () => false,
 	signal: undefined,
 	sessionManager: { getBranch: () => [] },
+	appendEntry: (customType, data) => { recorded.push({ customType, data }); },
+	ui: { notify: (message, level) => { notified.push({ message, level }); } },
 	getScopedModels: () => [
 		{ provider: "anthropic", id: "claude-haiku-4-5", model: { id: "claude-haiku-4-5" } },
 		{ provider: "anthropic", id: "claude-opus-5-5", model: { id: "claude-opus-5-5" } },
 	],
 	scopedModels: [],
 	model: undefined,
-	ui: { notify: (message, level) => console.log(`  [ui.${level}] ${message.split("\n")[0]}`), confirm: async () => false },
+	ui: { notify: (message, level) => { notified.push({ message, level }); console.log(`  [ui.${level}] ${message.split("\n")[0]}`); }, confirm: async () => false },
 };
 
 const files = readdirSync(join(root, "extensions")).filter((f) => f.endsWith(".ts")).sort();
@@ -263,6 +267,8 @@ if (process.argv.includes("--route")) {
 	];
 	const routeCtx = {
 		cwd: root,
+		appendEntry: (customType, data) => { recorded.push({ customType, data }); },
+		ui: { notify: (message, level) => { notified.push({ message, level }); } },
 		isProjectTrusted: () => process.env.TRUSTED === "1",
 		settingsOverride: { profiles: { "openrouter/space-bunny-alpha": { notes: "minimax-m3.1, unreleased, free. Code quality on par with DeepSeek V4 Flash (AA 34), just under GLM 5.3 Flash (AA 42), below both otherwise.", index: 37, costPerTask: 0 } } },
 		getScopedModels: () => catalog,
@@ -399,6 +405,10 @@ if (process.argv.includes("--route")) {
 		const routed = await definition.route({ reason: "user", messages, previous: { model: catalog[1].model, thinkingLevel: "medium" }, thinkingLevel: "medium" }, routeCtx);
 		globalThis.fetch = realFetch;
 		console.log(`history 3 prompts -> ${routed.model.id} @ ${routed.thinkingLevel} (${Date.now() - started}ms)`);
+		for (const entry of recorded.slice(-1)) {
+			console.log(`recorded ${entry.customType}: ${JSON.stringify(entry.data, null, 1).slice(0, 1600)}`);
+		}
+		console.log(`notified: ${notified.length ? notified.map((n) => n.message.replace(/\n/g, " | ")).join(" ; ") : "(none)"}`);
 	}
 
 	if (process.env.SHOW_STATE) {
@@ -461,6 +471,8 @@ if (process.argv.includes("--gate")) {
 		isProjectTrusted: () => false,
 		signal: undefined,
 		sessionManager: { getBranch: () => [] },
+	appendEntry: (customType, data) => { recorded.push({ customType, data }); },
+	ui: { notify: (message, level) => { notified.push({ message, level }); } },
 		ui: { notify: (message) => notifications.push(message), confirm: async () => confirm },
 	});
 	const call = (command) => ({ type: "tool_call", toolName: "bash", toolCallId: "t", input: { command } });

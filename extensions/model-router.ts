@@ -257,18 +257,6 @@ function sessionHistory(
 	return records.filter((record) => record.turns > 0).slice(-prompts);
 }
 
-function historyLines(records: readonly TurnRecord[], promptChars: number): string[] {
-	if (!records.length) return [];
-	const lines = records.map((record) => {
-		const prompt = record.prompt.length > promptChars ? `${record.prompt.slice(0, promptChars)}...` : record.prompt;
-		const dollars = `$${record.cost < 0.01 ? record.cost.toFixed(4) : record.cost.toFixed(3)}${record.estimated ? " estimated" : ""}`;
-		return (
-			`  "${prompt}" took ${record.turns} turn${record.turns === 1 ? "" : "s"} on ` +
-			`${record.models.join(", ")}, ${dollars} and ${Math.round(record.outputTokens)} output tokens`
-		);
-	});
-	return ["Earlier prompts in this session, and what answering them actually took:", ...lines, ""];
-}
 
 /**
  * Prompt size and expected answer size for the next turn, from what the last assistant
@@ -400,6 +388,8 @@ export default function (pi: ExtensionAPI) {
 			// three-turn task still read as multi-step, while showing the trivial question
 			// answered in one turn alongside it dropped the same follow-up to one task.
 			const historyPrompts = numberOption(options, "historyPrompts", 3);
+			const record = options.record !== false;
+			const notify = options.notify !== false;
 			const historyChars = numberOption(options, "historyChars", 240);
 			// What to do when the catalog prices every candidate at zero, which is the case
 			// for subscription bridges and free routers: there are no cache economics to
@@ -424,22 +414,48 @@ export default function (pi: ExtensionAPI) {
 
 			// Keep the turn together: continuation and retry stay on the same model so
 			// prompt caches and thinking signatures survive.
+			const previousLabel = request.previous ? labelOf(request.previous.model) : undefined;
+			const keep = (model: { provider?: string; id?: string }, thinkingLevel: unknown, why: string) => {
+				recordDecision(
+					ctx,
+					{
+						task: "",
+						history: [],
+						reason: request.reason,
+						previous: previousLabel,
+						decided: { model: labelOf(model), level: String(thinkingLevel), why },
+					},
+					record,
+					notify,
+				);
+				return { model: model as any, thinkingLevel: thinkingLevel as any };
+			};
 			if (request.reason === "continuation" && request.previous) {
-				return { model: request.previous.model, thinkingLevel: request.previous.thinkingLevel };
+				return keep(request.previous.model, request.previous.thinkingLevel, "continuation, kept for prompt cache");
 			}
 			if (request.reason === "retry" && request.failed) {
-				return { model: request.failed.model, thinkingLevel: request.failed.thinkingLevel };
+				return keep(request.failed.model, request.failed.thinkingLevel, "retry, kept on the failed model");
 			}
 			if (request.reason !== "user" || candidates.length < 2) {
-				return { model: fallback, thinkingLevel: request.thinkingLevel };
+				return keep(fallback, request.thinkingLevel, `${request.reason}, went to the fallback`);
 			}
 
 			const task = lastUserText(request.messages).slice(0, taskChars);
-			const history = historyLines(
-				sessionHistory(request.messages, candidates, historyPrompts, historyChars),
-				historyChars,
+			const history = sessionHistory(request.messages, candidates, historyPrompts, historyChars).map(
+				(record_) =>
+					`"${record_.prompt}" took ${record_.turns} turn${record_.turns === 1 ? "" : "s"} on ${record_.models.join(", ")}, ` +
+					`$${record_.cost < 0.01 ? record_.cost.toFixed(4) : record_.cost.toFixed(3)}${record_.estimated ? " estimated" : ""} ` +
+					`and ${Math.round(record_.outputTokens)} output tokens`,
 			);
-			const state = [`Task:\n${task}`, "", ...history, "Candidate models:", ...candidates.map(describe)].join("\n");
+			const state = [
+				`Task:\n${task}`,
+				"",
+				...(history.length
+					? ["Earlier prompts in this session, and what answering them actually took:", ...history.map((line) => `  ${line}`), ""]
+					: []),
+				"Candidate models:",
+				...candidates.map(describe),
+			].join("\n");
 			// Depth is asked on the levels `jev/auto` advertises and then narrowed by name
 			// to the winner's own levels. Intersecting them here instead would collapse the
 			// question to "off" as soon as one candidate cannot think.
@@ -477,12 +493,12 @@ export default function (pi: ExtensionAPI) {
 				// Depth first: the effort decides what a task costs, so the cost comparison
 				// has to happen at the effort that will actually be used.
 				const depth = result.answers.depth;
-				const requested = depth?.type === "score" ? levelLabel(depth) : "off";
+				const requested = depth?.type === "score" ? levelLabel(depth, depthCriteria) : "off";
 
 				// How long the work is decides how many turns a cache write can be spread
 				// over, which is what the stickiness rule weighs. Level 0 and 1 both mean this
 				// turn is the whole thing, so the write can never pay for itself.
-				const lengthIndex = argmaxIndex(result.answers.length, LENGTH_LEVELS.length);
+				const lengthIndex = argmaxIndex(result.answers.length, LENGTH_LEVELS);
 				const horizon = horizonSetting > 0 ? horizonSetting : (horizonByLevel[lengthIndex] ?? 1);
 
 				// Highest fit wins; models within tieMargin of it are treated as tied and the
@@ -601,28 +617,159 @@ export default function (pi: ExtensionAPI) {
 						);
 					}
 				}
+				const why = chosen === proposal
+					? current && proposal !== current
+						? "stayed on the current model"
+						: "Jev's proposal won outright"
+					: chosen === current
+						? "stayed: the switch did not pay for its cache write"
+						: "switched on capability";
+				recordDecision(
+					ctx,
+					{
+						task,
+						history,
+						reason: request.reason,
+						previous: previousLabel,
+						length: { level: LENGTH_LEVELS[lengthIndex], score: result.answers.length?.score, horizon },
+						depth: { level: requested, score: result.answers.depth?.score },
+						turn: { promptTokens: prefixTokens, outputTokens },
+						candidates: scored.map((entry) => ({
+							label: entry.candidate.label,
+							level: entry.level,
+							fit: Math.round(entry.fit * 1000) / 1000,
+							...(entry.aaCost !== undefined ? { aaCostPerTask: entry.aaCost } : {}),
+							costBasis: entry.cost,
+							warmTurn: Math.round(entry.warmTurn * 10000) / 10000,
+							coldTurn: Math.round(entry.coldTurn * 10000) / 10000,
+							...(entry.candidate.pricedFrom ? { ratesFrom: entry.candidate.pricedFrom } : {}),
+						})),
+						decided: { model: chosen.candidate.label, level: chosen.level, why },
+						answers: recordAnswers(result),
+					},
+					record,
+					notify,
+				);
 				return { model: chosen.candidate.model, thinkingLevel: chosen.level };
 			} catch (error) {
 				if (process.env.PI_JEV_ROUTER_DEBUG) console.error("jev router error:", error);
-				return { model: fallback, thinkingLevel: request.thinkingLevel };
+				return keep(fallback, request.thinkingLevel, `routing failed: ${(error as Error).message}`);
 			}
 		},
 	});
 }
 
-/** Index of the most probable level, falling back to the mean when there is no spread. */
-function argmaxIndex(answer: { type: string; probabilities?: Record<string, number>; score?: number } | undefined, levels: number): number {
+/**
+ * The winning level of a score answer, as a label.
+ *
+ * Endpoints disagree on what the probability keys are. open-jev keys them by criterion
+ * index and puts the labels in `legend`; the hosted API keys them by label. Reading the
+ * key as a label made every depth answer come back as a number, which silently collapsed
+ * the depth choice onto the lowest level a model supported.
+ */
+function winningLabel(answer: ScoreAnswerish | undefined, criteria: readonly string[]): string {
 	const entries = Object.entries(answer?.probabilities ?? {});
 	if (entries.length) {
-		const [label] = entries.reduce((a, b) => (b[1] > a[1] ? b : a));
-		const index = LENGTH_LEVELS.indexOf(label);
-		if (index >= 0) return index;
+		const [key] = entries.reduce((a, b) => (b[1] > a[1] ? b : a));
+		const legend = answer?.legend ?? {};
+		const fromLegend = typeof legend[key] === "string" ? (legend[key] as string) : undefined;
+		if (fromLegend && criteria.includes(fromLegend)) return fromLegend;
+		const index = Number(key);
+		if (Number.isInteger(index) && criteria[index]) return criteria[index];
+		if (criteria.includes(key)) return key;
 	}
 	const mean = answer?.score ?? 0;
-	return Math.max(0, Math.min(levels - 1, Math.round(mean)));
+	const index = Math.max(0, Math.min(criteria.length - 1, Math.round(mean)));
+	return criteria[index] ?? "off";
+}
+
+interface ScoreAnswerish {
+	type?: string;
+	probabilities?: Record<string, number>;
+	legend?: Record<string, unknown>;
+	score?: number;
+}
+
+/** Index of the winning level within `criteria`. */
+function argmaxIndex(answer: ScoreAnswerish | undefined, criteria: readonly string[]): number {
+	const label = winningLabel(answer, criteria);
+	const index = criteria.indexOf(label);
+	if (index >= 0) return index;
+	const mean = answer?.score ?? 0;
+	return Math.max(0, Math.min(criteria.length - 1, Math.round(mean)));
 }
 
 /** The score answer's winning level, falling back to rounding its mean index. */
+/** Where a decision is written down, for reading back out of the session file. */
+const ENTRY_TYPE = "jev-model-router.decision";
+
+/** Compact the answers so a session file stays readable and small. */
+function recordAnswers(result: { answers: Record<string, any> }): Record<string, unknown> {
+	const out: Record<string, unknown> = {};
+	for (const [id, answer] of Object.entries(result.answers ?? {})) {
+		const probabilities: Record<string, number> = {};
+		for (const [label, value] of Object.entries(answer.probabilities ?? {})) {
+			probabilities[label] = Math.round(Number(value) * 1000) / 1000;
+		}
+		out[id] =
+			answer.type === "noul"
+				? { type: "noul", noul: Math.round(Number(answer.noul) * 1000) / 1000 }
+				: {
+						type: answer.type,
+						...(answer.type === "choice" ? { choice: answer.choice } : { score: answer.score }),
+						...(Object.keys(probabilities).length ? { probabilities } : {}),
+					};
+	}
+	return out;
+}
+
+/**
+ * Write one decision to the session and, when the model actually changed, say so.
+ *
+ * The entry holds what Jev was asked and what it said, so a routing choice can be
+ * reconstructed from the session file afterwards. Data-only custom entries are not sent
+ * to the model, so this costs no context.
+ */
+function recordDecision(
+	ctx: ExtensionContext,
+	record_: {
+		task: string;
+		history: string[];
+		reason: string;
+		length?: { level: string; score?: number; horizon: number };
+		depth?: { level: string; score?: number };
+		candidates?: unknown[];
+		decided: { model: string; level: string; why: string };
+		previous?: string;
+		elapsedMs?: number;
+		answers?: Record<string, unknown>;
+		fallback?: string;
+	},
+	recordEnabled: boolean,
+	notifyEnabled: boolean,
+): void {
+	const payload = { at: new Date().toISOString(), ...record_ };
+	if (recordEnabled) {
+		try {
+			ctx.appendEntry(ENTRY_TYPE, payload);
+		} catch {
+			// Recording is a convenience; never let it fail a request.
+		}
+	}
+	const switched = record_.previous !== undefined && record_.previous !== record_.decided.model;
+	if (!notifyEnabled || !switched) return;
+	const { model, level, why } = record_.decided;
+	const length = record_.length ? `${record_.length.level}, horizon ${record_.length.horizon}` : "length unknown";
+	try {
+		ctx.ui.notify(
+			`jev: ${record_.previous} -> ${model} @ ${level}\n${why}. Length: ${length}. PI_JEV_ROUTER_DEBUG=1 prints the arithmetic.`,
+			"info",
+		);
+	} catch {
+		// No UI attached, nothing to say.
+	}
+}
+
 function levelLabel(answer: { probabilities: Record<string, number>; score: number }): string {
 	const entries = Object.entries(answer.probabilities ?? {});
 	if (entries.length) {
