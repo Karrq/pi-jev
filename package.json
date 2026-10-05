@@ -13,7 +13,8 @@
       "extensions/dropper.ts",
       "extensions/file-relevance.ts",
       "extensions/bash-gate.ts",
-      "extensions/model-router.ts"
+      "extensions/model-router.ts",
+      "extensions/provider.ts"
     ]
   },
   "keywords": [
