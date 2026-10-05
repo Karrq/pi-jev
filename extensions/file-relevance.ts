@@ -8,11 +8,13 @@
  * few thousand tokens. Per question the most confident chunk wins.
  *
  * Settings: overrides["jev-file-relevance"] = { chunkChars, overlapChars, maxChunks,
- * maxFiles, filesPerRequest, maxBatchChars, maxFileBytes, maxQuestions, concurrency }
+ * maxFiles, maxScanChars, filesPerRequest, maxBatchChars, maxFileBytes, maxQuestions,
+ * concurrency }
  *
- * maxFiles is how much of the tree is read at all (200 by default); the read set is
- * then split into requests of at most filesPerRequest files and maxBatchChars
- * characters so each request stays quick.
+ * maxFiles and maxScanChars decide how much of the tree is read at all; maxScanChars
+ * is the one that bounds how long the call takes, since time tracks characters read.
+ * The read set is then split into requests of at most filesPerRequest files and
+ * maxBatchChars characters, so each request stays quick.
  *
  * Patterns follow .gitignore, so a `**` scan does not read node_modules. A pattern
  * may opt out with the `i` flag, `<i>/**`.
@@ -26,8 +28,8 @@ import { resolve } from "../src/config.ts";
 import { systemOne } from "../src/client.ts";
 import { distribution, formatAnswer, topLabel, type JevAnswer, type JevQuestion } from "../src/types.ts";
 import { failure, numberOption, text } from "../src/shared.ts";
-import { readPathPatterns, expandPattern, type SourceBlock } from "../src/sources.ts";
-import { extname, posix, relative } from "node:path";
+import { readPathPatterns, globToRegExp, type SourceBlock } from "../src/sources.ts";
+import { extname, posix, resolve as resolvePath } from "node:path";
 
 const MAX_OVERFLOW_GLOBS = 6;
 const MAX_OTHER_SKIPS = 5;
@@ -40,18 +42,31 @@ const FileParams = Type.Object({
 			description:
 				"File, directory, or glob, relative to the working directory or absolute; a directory is walked recursively and " +
 				"globs are expanded. .gitignore applies, so `**` skips node_modules and build output; prefix a pattern with " +
-				"<i>/ to include those. Files are read in the order given, and only the first maxFiles are read, which is a " +
-				"latency guard rather than a search budget. A scan reads more than a few files and asks about them in " +
-				"several small requests, so a wide pattern is cheap.",
+				"<i>/ to include those, or name an ignored path outright to read it. Files are read in the order given, " +
+				"and reading stops at maxFiles files or maxScanChars characters (300k), which bounds how long the call takes. " +
+				"The read set is asked about in several small requests, so a wide pattern is cheap.",
 		}),
 		{ minItems: 1, description: "Files to read" },
 	),
 	questions: Type.Array(
 		Type.Object({
-			id: Type.Optional(Type.String()),
-			instructions: Type.String({ description: "What to determine from the files" }),
-			type: Type.Optional(Type.Union([Type.Literal("noul"), Type.Literal("choice"), Type.Literal("score")])),
-			criteria: Type.Optional(Type.Array(Type.String(), { description: "choice/score criteria, 'label: description' for choice" })),
+			id: Type.Optional(Type.String({ description: "Key for the answer; defaults to q1, q2, ..." })),
+			instructions: Type.String({ description: "What to determine from the files, phrased to fit the type" }),
+			type: Type.Optional(
+				Type.Union([Type.Literal("noul"), Type.Literal("choice"), Type.Literal("score")], {
+					description:
+						"noul = yes/no probability (default), choice = pick one label, score = pick an ordered level. " +
+						"There is no free-text answer: ask 'Does any file X?', not 'List the files that X'.",
+				}),
+			),
+			criteria: Type.Optional(
+				Type.Array(Type.String(), {
+					description:
+						"Required for choice and score, at least 2 entries; omit for noul. " +
+						"choice: labels, optionally 'label: description', e.g. ['tool: registers a tool', 'command: registers a command', 'none: neither']. " +
+						"score: levels from lowest to highest, e.g. ['none', 'partial', 'complete'].",
+				}),
+			),
 		}),
 		{ minItems: 1, description: "Typed questions to answer about the files" },
 	),
@@ -208,40 +223,34 @@ export function batchChunks(chunks: Chunk[], maxFiles: number, maxChars: number)
 	return batches;
 }
 
-/** Notes for files that were never read: a glob for the overflow, at most a few lines for the rest. */
-export async function skipNotes(
+/**
+ * Notes for files that were never read: a glob for the overflow, at most a few lines
+ * for the rest.
+ *
+ * The globs are built from the dropped paths themselves, so they describe exactly
+ * what was not read. A glob can still catch a file that was read, which is checked
+ * against the read set (bounded by maxFiles) rather than by expanding the glob.
+ */
+export function skipNotes(
 	skipped: { origin: string; reason: string }[],
 	overflowReason: (reason: string) => boolean,
 	cwd: string,
 	readPaths: Set<string>,
-): Promise<string[]> {
+): string[] {
 	const overflow = skipped.filter((skip) => overflowReason(skip.reason));
 	const other = skipped.filter((skip) => !overflowReason(skip.reason));
 	const notes: string[] = [];
 	if (overflow.length) {
-		// Propose globs for what is left: expand them, drop everything already read, and
-		// describe the remainder, so following up does not re-read the same files.
-		const candidates = overflowGlobs(overflow.map((skip) => skip.origin));
-		const unread = new Set<string>();
-		for (const glob of candidates) {
-			for (const match of await expandPattern(glob, cwd)) {
-				const rel = relative(cwd, match);
-				if (!readPaths.has(rel) && !readPaths.has(match)) unread.add(rel);
-			}
-		}
-		// Anything the globs missed (an ignore rule the follow-up would also skip) stays
-		// listed by name, capped.
-		const remaining = overflow.map((skip) => skip.origin).filter((origin) => !unread.has(origin));
-		const globs = overflowGlobs([...unread]);
+		const globs = overflowGlobs(overflow.map((skip) => skip.origin));
 		const shown = globs.slice(0, MAX_OVERFLOW_GLOBS);
 		const rest = globs.length - shown.length;
-		if (shown.length) {
-			notes.push(
-				`not read, ${unread.size} file(s) still match ${shown.join(", ")}${rest > 0 ? `, and ${rest} more pattern(s)` : ""} (these exclude what was just read; raise maxFiles to include them)`,
-			);
-		}
-		for (const origin of remaining.slice(0, MAX_OTHER_SKIPS)) notes.push(`not read, no single pattern covers it: ${origin}`);
-		if (remaining.length > MAX_OTHER_SKIPS) notes.push(`not read, ${remaining.length - MAX_OTHER_SKIPS} more file(s) with no single pattern`);
+		const overlap = new Set(
+			[...readPaths].filter((path) => shown.some((glob) => globToRegExp(resolvePath(cwd, glob)).test(resolvePath(cwd, path)))),
+		);
+		notes.push(
+			`not read, ${overflow.length} file(s) still match ${shown.join(", ")}${rest > 0 ? `, and ${rest} more pattern(s)` : ""} ` +
+				`(raise maxFiles or maxScanChars to include them${overlap.size ? `; these would re-read up to ${overlap.size} file(s) already read` : ""})`,
+		);
 	}
 	for (const skip of other.slice(0, MAX_OTHER_SKIPS)) notes.push(`skipped ${skip.origin} (${skip.reason})`);
 	if (other.length > MAX_OTHER_SKIPS) notes.push(`skipped ${other.length - MAX_OTHER_SKIPS} more file(s) for other reasons`);
@@ -256,8 +265,21 @@ export default function (pi: ExtensionAPI) {
 			"Answer typed questions about many files at once, returning only each answer with the file and character range " +
 			"it came from. Cheap enough to use first whenever a question spans several files or you are unsure which files hold " +
 			"the answer: prefer it over opening files yourself or grepping via `bash`, and survey with a broad glob over the " +
-			"relevant subtree before narrowing to a read.",
-		promptSnippet: "Answer typed questions across many files cheaply, without loading them into context",
+			"relevant subtree before narrowing to a read.\n\n" +
+			"Answers are yes/no (noul), one label (choice), or a level (score), never free text. The per-request lines " +
+			"show which group of files each answer came from; rerun on a narrower path to pin one file down.\n\n" +
+			"Examples:\n" +
+			'- {"paths": ["src/**/*.ts"], "questions": [{"id": "retry", "instructions": "Does any file retry failed HTTP requests?"}]}\n' +
+			'- {"paths": ["extensions"], "questions": [{"id": "kind", "type": "choice", "instructions": "What does this extension register?", ' +
+			'"criteria": ["tool: a tool", "command: a slash command", "both: a tool and a command", "none: neither"]}]}\n' +
+			'- {"paths": ["README.md", "docs/*.md"], "questions": [{"id": "setup", "type": "score", "instructions": "How completely are setup steps documented?", ' +
+			'"criteria": ["none", "partial", "complete"]}]}',
+		promptSnippet:
+			"Ask yes/no, choice, or score questions over many files or globs at once; use it before read, grep, or bash when the answer could be in several files",
+		promptGuidelines: [
+			"Use jev_file first for questions that span several files or an unknown location, then read only the files it points to",
+			"In jev_file, choice and score questions need at least 2 criteria, e.g. criteria: ['tool: registers a tool', 'command: registers a command']; noul questions take no criteria",
+		],
 		parameters: FileParams,
 
 		async execute(_id, params, signal, onUpdate, ctx) {
@@ -268,6 +290,8 @@ export default function (pi: ExtensionAPI) {
 			const overlapChars = numberOption(options, "overlapChars", 1_000);
 			const maxChunks = numberOption(options, "maxChunks", 8);
 			const maxFiles = numberOption(options, "maxFiles", 200);
+			// Chars, not files, bound how long a scan takes, so they are the real budget.
+			const maxScanChars = numberOption(options, "maxScanChars", 300_000);
 			const maxFileBytes = numberOption(options, "maxFileBytes", 2 << 20);
 			const concurrency = numberOption(options, "concurrency", 1);
 			const maxQuestions = numberOption(options, "maxQuestions", 12);
@@ -277,7 +301,7 @@ export default function (pi: ExtensionAPI) {
 			const maxBatchChars = numberOption(options, "maxBatchChars", 48_000);
 
 			try {
-				const found = await readPathPatterns(params.paths, { cwd: ctx.cwd, maxFileBytes, maxFiles });
+				const found = await readPathPatterns(params.paths, { cwd: ctx.cwd, maxFileBytes, maxFiles, maxChars: maxScanChars });
 				if (found.blocks.length === 0) {
 					throw new Error(`no files matched: ${params.paths.join(", ")}`);
 				}
@@ -331,8 +355,11 @@ export default function (pi: ExtensionAPI) {
 				});
 
 				const best: Record<string, { answer: JevAnswer; chunk: Chunk }> = {};
-				for (const { chunk, answers: perChunk } of answers) {
-					for (const [id, answer] of Object.entries(perChunk)) {
+				for (const { batch, answers: perBatch } of answers) {
+					// One answer covers the whole request, so credit it to the longest chunk in
+					// it: the range then points at the biggest stretch of text it covers.
+					const chunk = batch.reduce((bestChunk, candidate) => (candidate.text.length > bestChunk.text.length ? candidate : bestChunk));
+					for (const [id, answer] of Object.entries(perBatch)) {
 						if (betterThan(best[id]?.answer, answer)) best[id] = { answer, chunk };
 					}
 				}
@@ -342,23 +369,25 @@ export default function (pi: ExtensionAPI) {
 					return `${id}: ${formatAnswer(answer)} [${where}]`;
 				});
 				const perChunkLines = answers.map(
-					({ chunk, answers: perChunk, elapsedMs }) =>
-						`${found.blocks[chunk.source].label} ${chunk.start}-${chunk.end}: ${Object.entries(perChunk)
+					({ batch, answers: perBatch, elapsedMs }) => {
+						const files = [...new Set(batch.map((chunk) => found.blocks[chunk.source].label))];
+						return `${files.slice(0, 3).join(", ")}${files.length > 3 ? ` +${files.length - 3} more` : ""}: ${Object.entries(perBatch)
 							.map(([id, answer]) => `${id}=${topLabel(answer).label}`)
-							.join(", ")} [${elapsedMs}ms]`,
+							.join(", ")} [${elapsedMs}ms]`;
+					},
 				);
 				const totalMs = Date.now() - startedAll;
 				const notes = [
 					...found.missing.map((pattern) => `no match: ${pattern}`),
-					...(await skipNotes(
+					...skipNotes(
 						found.skipped,
-						(reason) => reason.startsWith("maxFiles"),
+						(reason) => reason.startsWith("maxFiles") || reason.startsWith("maxChars"),
 						ctx.cwd,
 						new Set(found.blocks.map((block) => block.label)),
-					)),
+					),
 					...(truncatedFiles.length ? [`read only the first ${maxChunks} chunks of: ${truncatedFiles.join(", ")}`] : []),
 				];
-				const header = `[jev file ${endpoint.name}: ${found.blocks.length} file(s), ${totalChars} chars, ${chunks.length} chunk(s), ${totalMs}ms]`;
+				const header = `[jev file ${endpoint.name}: ${found.blocks.length} file(s), ${totalChars} chars, ${chunks.length} chunk(s), ${answers.length} request(s), ${totalMs}ms]`;
 
 				return {
 					...text([header, "", ...lines, "", ...perChunkLines, ...(notes.length ? ["", ...notes] : [])].join("\n")),

@@ -7,8 +7,8 @@
  */
 
 import { spawn } from "node:child_process";
-import { readFile, stat } from "node:fs/promises";
-import { isAbsolute, relative, resolve as resolvePath } from "node:path";
+import { readFile, readdir, stat } from "node:fs/promises";
+import { isAbsolute, join, relative, resolve as resolvePath } from "node:path";
 import { glob } from "node:fs/promises";
 import { Gitignore } from "./gitignore.ts";
 
@@ -34,6 +34,8 @@ export interface ResolveOptions {
 	maxFiles?: number;
 	/** Skip directories that would produce this many matches. */
 	maxMatches?: number;
+	/** Stop reading past this many characters across all files. */
+	maxChars?: number;
 }
 
 /**
@@ -61,40 +63,94 @@ const DEFAULT_MAX_FILES = 40;
  *
  * A pattern may carry `<flags>/` in front of it; `i` includes the files and
  * directories .gitignore excludes, which are skipped otherwise.
+ *
+ * Reading stops at maxFiles files or maxChars characters, whichever comes first;
+ * one file is always read even when it alone exceeds maxChars.
  */
+
+/** Every file under `dir`, pruning directories .gitignore excludes. */
+export async function listFiles(dir: string, options: { includeIgnored: boolean; gitignore: Gitignore; limit?: number }): Promise<string[]> {
+	const { includeIgnored, gitignore, limit = Number.POSITIVE_INFINITY } = options;
+	const files: string[] = [];
+	const queue = [dir];
+	while (queue.length && files.length < limit) {
+		const current = queue.shift()!;
+		let entries;
+		try {
+			entries = await readdir(current, { withFileTypes: true });
+		} catch {
+			continue;
+		}
+		for (const entry of entries) {
+			const full = join(current, entry.name);
+			if (entry.isSymbolicLink()) continue;
+			if (entry.isDirectory()) {
+				if (includeIgnored || !(await gitignore.dirIgnored(full))) queue.push(full);
+				continue;
+			}
+			if (includeIgnored || !(await gitignore.isIgnored(full))) files.push(full);
+		}
+	}
+	return files;
+}
+
+/** Glob to a regex over absolute paths, with `**` crossing directories and `*` not matching a dot. */
+export function globToRegExp(pattern: string): RegExp {
+	const normalised = pattern.replace(/\\/g, "/").replace(/\/+$/, "");
+	const parts = normalised.split("/");
+	let out = "";
+	for (let index = 0; index < parts.length; index++) {
+		const part = parts[index];
+		const last = index === parts.length - 1;
+		if (part === "**") {
+			out += last ? ".+" : "(?:[^/]+/)*";
+			continue;
+		}
+		out += part
+			.split("")
+			.map((char, position) => {
+				if (char === "*") return position === 0 && !part.startsWith(".") ? "(?!\\.)[^/]*" : "[^/]*";
+				if (char === "?") return "[^/]";
+				return char.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+			})
+			.join("");
+		if (!last) out += "/";
+	}
+	return new RegExp(`^${out}$`);
+}
+
+/** The deepest directory a pattern can only be below, so the walk starts there. */
+function literalPrefix(absolute: string): string {
+	const parts = absolute.split("/");
+	const firstMagic = parts.findIndex((part) => /[*?[{]/.test(part));
+	if (firstMagic < 0) return absolute;
+	return parts.slice(0, firstMagic).join("/") || "/";
+}
+
 export async function readPathPatterns(patterns: string[], options: ResolveOptions): Promise<{
 	blocks: SourceBlock[];
 	missing: string[];
 	skipped: { origin: string; reason: string }[];
 }> {
-	const { cwd, maxFileBytes = DEFAULT_MAX_FILE_BYTES, maxFiles = DEFAULT_MAX_FILES } = options;
+	const { cwd, maxFileBytes = DEFAULT_MAX_FILE_BYTES, maxFiles = DEFAULT_MAX_FILES, maxChars = Number.POSITIVE_INFINITY } = options;
 	const missing: string[] = [];
 	const skipped: { origin: string; reason: string }[] = [];
 	const seen = new Set<string>();
 	const blocks: SourceBlock[] = [];
 	const gitignore = await Gitignore.load(cwd);
-	const memo = new Map<string, boolean>();
-	// Filtering happens after expansion: node's glob cannot prune by .gitignore.
-	const keep = async (path: string) => {
-		let cached = memo.get(path);
-		if (cached === undefined) {
-			cached = !(await gitignore.isIgnored(path));
-			memo.set(path, cached);
-		}
-		return cached;
-	};
-
+	// A literal path is read as given; a glob is expanded by walking from its literal
+	// prefix and testing each file, so ignored directories are pruned rather than
+	// expanded and filtered afterwards.
 	for (const raw of patterns) {
 		const { pattern, includeIgnored } = parsePattern(raw);
 		const absolute = isAbsolute(pattern) ? pattern : resolvePath(cwd, pattern);
 		const isGlob = /[*?[{]/.test(pattern);
 		let candidates: string[];
 		if (isGlob) {
-			candidates = [];
-			for await (const match of glob(absolute, { withFileTypes: false })) {
-				const file = String(match);
-				if (includeIgnored || (await keep(file))) candidates.push(file);
-			}
+			const regex = globToRegExp(absolute);
+			const base = literalPrefix(absolute);
+			const found = (await listFiles(base, { includeIgnored, gitignore })).filter((file) => regex.test(file));
+			candidates = found.length ? found : await expandPattern(pattern, cwd);
 		} else {
 			candidates = [absolute];
 		}
@@ -112,9 +168,7 @@ export async function readPathPatterns(patterns: string[], options: ResolveOptio
 				continue;
 			}
 			if (info.isDirectory()) {
-				for await (const match of glob(resolvePath(candidate, "**/*"), { withFileTypes: false })) {
-					const file = String(match);
-					if (!includeIgnored && !(await keep(file))) continue;
+				for (const file of await listFiles(candidate, { includeIgnored, gitignore })) {
 					if (seen.has(file)) continue;
 					seen.add(file);
 					const entry = await readOne(file, cwd, maxFileBytes, blocks, skipped);
@@ -127,9 +181,22 @@ export async function readPathPatterns(patterns: string[], options: ResolveOptio
 		}
 	}
 
-	if (blocks.length > maxFiles) {
-		for (const extra of blocks.splice(maxFiles)) skipped.push({ origin: extra.origin, reason: `maxFiles ${maxFiles}` });
+	// The budget decides how much of the tree is read at all. Anything past it is
+	// reported as a glob for the model to ask for, not as a line per file.
+	const kept: SourceBlock[] = [];
+	let chars = 0;
+	for (const block of blocks) {
+		const overFiles = kept.length >= maxFiles;
+		const overChars = kept.length > 0 && chars + block.text.length > maxChars;
+		if (overFiles || overChars) {
+			skipped.push({ origin: block.origin, reason: overFiles ? `maxFiles ${maxFiles}` : `maxChars ${maxChars}` });
+			continue;
+		}
+		kept.push(block);
+		chars += block.text.length;
 	}
+	blocks.length = 0;
+	blocks.push(...kept);
 	return { blocks, missing, skipped };
 }
 

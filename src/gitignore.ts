@@ -11,7 +11,7 @@
  */
 
 import { readFile } from "node:fs/promises";
-import { isAbsolute, join, relative, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 
 interface Rule {
 	regex: RegExp;
@@ -96,8 +96,9 @@ function translate(pattern: string): string {
 }
 
 export class Gitignore {
-	private files = 0;
+	private loaded = 0;
 	private cache = new Map<string, Promise<Rule[]>>();
+	private dirCache = new Map<string, Promise<boolean>>();
 
 	constructor(private root: string) {}
 
@@ -109,13 +110,37 @@ export class Gitignore {
 
 	/** True when git would ignore this path. `.git` itself always counts. */
 	async isIgnored(absolute: string): Promise<boolean> {
+		// A file under an ignored directory is ignored, and that answer is the same for
+		// every file in it, so directories are the unit that gets remembered.
+		if (await this.dirIgnored(dirname(absolute))) return true;
+		const rel = this.relOf(absolute);
+		if (rel === null) return false;
+		return this.matches(rel);
+	}
+
+	/** Whether the directory itself is ignored, memoized. */
+	dirIgnored(dir: string): Promise<boolean> {
+		let pending = this.dirCache.get(dir);
+		if (!pending) {
+			const rel = this.relOf(dir);
+			// rel === "" is the `.git` case, which git always ignores.
+			pending = Promise.resolve(rel === null ? false : rel === "" ? true : this.matches(rel));
+			this.dirCache.set(dir, pending);
+		}
+		return pending;
+	}
+
+	private relOf(absolute: string): string | null {
 		const parts = relative(this.root, absolute).split(/[/\\]/);
-		if (parts.includes(".git")) return true;
+		if (parts.includes(".git")) return "";
 		const rel = parts.join("/");
-		if (!rel || rel.startsWith("..")) return false;
+		return !rel || rel.startsWith("..") ? null : rel;
+	}
+
+	/** Last matching rule wins, deepest directory first. */
+	private async matches(rel: string): Promise<boolean> {
+		const parts = rel.split("/");
 		let ignored = false;
-		// The deepest .gitignore decides first, so walk from the file's own directory
-		// up to the root and let the last match win.
 		for (let depth = parts.length; depth > 0; depth--) {
 			for (const rule of await this.rules(join(this.root, ...parts.slice(0, depth - 1)))) {
 				if (rule.regex.test(rel)) ignored = !rule.negate;
@@ -127,15 +152,16 @@ export class Gitignore {
 	private rules(dir: string): Promise<Rule[]> {
 		let pending = this.cache.get(dir);
 		if (!pending) {
-			if (this.files >= MAX_FILES) return Promise.resolve([]);
-			this.files++;
+			if (this.loaded >= MAX_FILES) return Promise.resolve([]);
 			const base = relative(this.root, dir);
 			pending = readFile(join(dir, GITIGNORE), "utf8").then(
-				(text) =>
-					text
+				(text) => {
+					this.loaded++;
+					return text
 						.split(/\r?\n/)
 						.map((line) => ruleFrom(line, base))
-						.filter((rule): rule is Rule => rule !== null),
+						.filter((rule): rule is Rule => rule !== null);
+				},
 				() => [],
 			);
 			this.cache.set(dir, pending);

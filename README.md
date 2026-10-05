@@ -146,7 +146,19 @@ Two parameters only: `paths` and `questions`. Chunking is not the model's decisi
 Files are read internally in pieces (16k characters by default, 1k overlap) because
 accuracy falls off past a few thousand tokens; per question the most confident piece
 wins, and the answer names the file and character range it came from.
+
+Patterns follow `.gitignore`, so `**` scans skip `node_modules` and build output.
+A pattern opts out with the `i` flag, `<i>/**`. A path named outright is always read.
+
+`maxFiles` (200) and `maxScanChars` (300k) decide how much of the tree is read at all.
+Characters are the real bound on time: the local endpoint runs at roughly 5.5k
+characters per second, so a full budget is under a minute. What is read goes out as
+several requests of at most `filesPerRequest` files and `maxBatchChars` characters,
+so no single request is long. Anything past the budget comes back as one line of
+globs matching only what was not read.
+
 `details.resolvedPaths` lists the absolute paths that matched. `chunkChars`, `overlapChars`, `maxChunks`, `maxFiles`, `maxFileBytes`,
+`maxScanChars`, `filesPerRequest`, `maxBatchChars`,
 `maxQuestions` and `concurrency` live in `overrides["jev-file-relevance"]`. Chunks
 run one at a time because a local server serializes requests; raise `concurrency`
 for a hosted endpoint.
