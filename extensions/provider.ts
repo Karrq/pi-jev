@@ -21,7 +21,9 @@
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { resolve } from "../src/config.ts";
+import { ensureLocalService, rootUrlOf } from "../src/autostart.ts";
+import { loadSettings, resolve } from "../src/config.ts";
+import type { JevSettings } from "../src/config.ts";
 
 const PROVIDER = "local-jev";
 const API = "typesafe-system-one";
@@ -40,6 +42,26 @@ interface Registered {
 function classifierBaseUrl(url: string): string {
 	const trimmed = url.replace(/\/+$/, "");
 	return trimmed.endsWith("/v1") ? trimmed : `${trimmed}/v1`;
+}
+
+/** Guards against firing more than one service start at a time. */
+let starting: Promise<unknown> | undefined;
+
+/** Start the local open-jev service on session start, when settings ask for it. */
+function maybeStart(ctx: ExtensionContext, settings: JevSettings): void {
+	if (settings.autostart !== true || starting) return;
+	const rootUrl = rootUrlOf(resolve(ctx.cwd, "provider", ctx.isProjectTrusted()).endpoint.url);
+	starting = ensureLocalService({
+		rootUrl,
+		autostart: true,
+		label: settings.server?.label,
+		command: settings.server?.command,
+		cwd: settings.server?.cwd,
+		timeoutMs: settings.server?.timeoutMs,
+		notify: (message, level) => ctx.ui.notify(message, level),
+	}).finally(() => {
+		starting = undefined;
+	});
 }
 
 export default function (pi: ExtensionAPI) {
@@ -88,6 +110,9 @@ export default function (pi: ExtensionAPI) {
 	sync(process.cwd(), false);
 
 	pi.on("session_start", (_event, ctx: ExtensionContext) => {
-		sync(ctx.cwd, ctx.isProjectTrusted());
+		const trusted = ctx.isProjectTrusted();
+		sync(ctx.cwd, trusted);
+		const { settings } = loadSettings(ctx.cwd, trusted);
+		void maybeStart(ctx, settings);
 	});
 }

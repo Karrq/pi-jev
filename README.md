@@ -75,6 +75,13 @@ settings file (user level, then project level once trusted):
 
 With no `pi-jev` key, everything uses `http://127.0.0.1:10610`.
 
+Set `pi-jev.autostart` to `true` to have pi bring the local open-jev service up at
+session start when `GET /health` does not answer. It is off by default and only ever
+applies to a loopback endpoint. `pi-jev.server.label` (default `local.openjev.server`)
+names the launchd agent to kickstart; `pi-jev.server.command` spawns a shell command
+instead (use it off macOS), with `pi-jev.server.cwd` as its working directory, and
+`pi-jev.server.timeoutMs` (default 120000) bounds how long pi waits for `/health`.
+
 ## The tools
 
 ### `ask_jev`

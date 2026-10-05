@@ -34,6 +34,16 @@ export interface EndpointConfig {
 	headers?: Record<string, string>;
 }
 
+export interface JevServerSettings {
+	/** launchd label to kickstart on macOS. Default "local.openjev.server". */
+	label?: string;
+	/** Command to spawn instead of launchd. */
+	command?: string;
+	cwd?: string;
+	/** How long to wait for /health after starting, ms. Default 120000. */
+	timeoutMs?: number;
+}
+
 export interface JevSettings {
 	/** Which entry of `endpoints` to use. Defaults to "local", then to `url`. */
 	endpoint?: string;
@@ -47,6 +57,13 @@ export interface JevSettings {
 	overrides?: Record<string, Record<string, unknown>>;
 	/** Shown to the model and in /jev to explain where requests go. */
 	defaults?: Record<string, unknown>;
+	/**
+	 * Start the local open-jev service when the endpoint is not answering. Off by
+	 * default, and only ever applies to a local endpoint. See `server` for the
+	 * launchd label or command to use.
+	 */
+	autostart?: boolean;
+	server?: JevServerSettings;
 }
 
 export interface ResolvedEndpoint {
