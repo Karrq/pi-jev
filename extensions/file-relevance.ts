@@ -25,8 +25,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { resolve } from "../src/config.ts";
-import { systemOne } from "../src/client.ts";
-import { distribution, formatAnswer, topLabel, type JevAnswer, type JevQuestion } from "../src/types.ts";
+import { classify, distribution, formatAnswer, noul, topLabel, type JevAnswer, type JevQuestion } from "../src/classifier.ts";
 import { failure, numberOption, text } from "../src/shared.ts";
 import { readPathPatterns, globToRegExp, type SourceBlock } from "../src/sources.ts";
 import { extname, posix, resolve as resolvePath } from "node:path";
@@ -98,7 +97,7 @@ export function buildQuestions(specs: Spec[]): Record<string, JevQuestion> {
 			if (criteria.length < 2) throw new Error(`score question ${id} needs at least 2 criteria`);
 			questions[id] = { type: "score", instructions, criteria };
 		} else {
-			questions[id] = { type: "noul", instructions };
+			questions[id] = noul(instructions);
 		}
 	});
 	return questions;
@@ -129,7 +128,7 @@ export function chunkFile(block: SourceBlock, chunkChars: number, overlapChars: 
 /** Most confident answer per question across chunks. */
 function betterThan(current: JevAnswer | undefined, candidate: JevAnswer): boolean {
 	if (!current) return true;
-	const scoreOf = (answer: JevAnswer) => (answer.type === "noul" ? Math.abs(answer.noul - 0.5) * 2 : answer.confidence);
+	const scoreOf = (answer: JevAnswer) => (answer.type === "bool" ? Math.abs(answer.probability - 0.5) * 2 : answer.confidence);
 	return scoreOf(candidate) > scoreOf(current);
 }
 
@@ -340,7 +339,7 @@ export default function (pi: ExtensionAPI) {
 				let done = 0;
 				const answers = await mapLimit(batches, concurrency, async (batch) => {
 					const state = batch.map(stateOf).join("\n\n");
-					const result = await systemOne(endpoint, state, questions, { signal });
+					const result = await classify(ctx, state, questions, { signal });
 					done++;
 					onUpdate?.({
 						content: [
@@ -351,7 +350,7 @@ export default function (pi: ExtensionAPI) {
 						],
 						details: { files: found.blocks.length, chars: totalChars, chunks: chunks.length, requests: batches.length, done },
 					});
-					return { batch, answers: result.answers, elapsedMs: result.elapsedMs };
+					return { batch, answers: result.answers, elapsedMs: result.elapsedMs, provider: result.provider };
 				});
 
 				const best: Record<string, { answer: JevAnswer; chunk: Chunk }> = {};
@@ -387,7 +386,8 @@ export default function (pi: ExtensionAPI) {
 					),
 					...(truncatedFiles.length ? [`read only the first ${maxChunks} chunks of: ${truncatedFiles.join(", ")}`] : []),
 				];
-				const header = `[jev file ${endpoint.name}: ${found.blocks.length} file(s), ${totalChars} chars, ${chunks.length} chunk(s), ${answers.length} request(s), ${totalMs}ms]`;
+				const provider = answers[0]?.provider ?? endpoint.name;
+				const header = `[jev file ${provider}: ${found.blocks.length} file(s), ${totalChars} chars, ${chunks.length} chunk(s), ${answers.length} request(s), ${totalMs}ms]`;
 
 				return {
 					...text([header, "", ...lines, "", ...perChunkLines, ...(notes.length ? ["", ...notes] : [])].join("\n")),

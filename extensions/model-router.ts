@@ -42,7 +42,7 @@ import type { Message, Model } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext, ModelRoute, ModelRouteRequest } from "@earendil-works/pi-coding-agent";
 import { costAtLevel, effortLines, type ManualProfile } from "../src/aa.ts";
 import { readAgentSettings, resolve } from "../src/config.ts";
-import { systemOne } from "../src/client.ts";
+import { classify } from "../src/classifier.ts";
 import { listOption, numberOption, profilesOption, stringOption } from "../src/shared.ts";
 
 const EXTENSION = "jev-model-router";
@@ -532,7 +532,6 @@ export default function (pi: ExtensionAPI) {
 
 			const hasAa = candidates.some((candidate) => effortLines(candidate.model, candidate.profile) !== undefined);
 			try {
-				const { endpoint } = resolve(ctx.cwd ?? process.cwd(), EXTENSION, ctx.isProjectTrusted());
 				const questions: Record<string, any> = {};
 				for (const [index, candidate] of candidates.entries()) {
 					questions[`fit_${index}`] = {
@@ -556,7 +555,7 @@ export default function (pi: ExtensionAPI) {
 					criteria: depthCriteria,
 				};
 
-				const result = await systemOne(endpoint, state, questions, { signal: request.signal });
+				const result = await classify(ctx, state, questions, { signal: request.signal });
 
 				// Depth first: the effort decides what a task costs, so the cost comparison
 				// has to happen at the effort that will actually be used.
@@ -874,8 +873,8 @@ function recordAnswers(result: { answers: Record<string, any> }): Record<string,
 			probabilities[label] = Math.round(Number(value) * 1000) / 1000;
 		}
 		out[id] =
-			answer.type === "noul"
-				? { type: "noul", noul: Math.round(Number(answer.noul) * 1000) / 1000 }
+			answer.type === "bool"
+				? { type: "bool", probability: Math.round(Number(answer.probability) * 1000) / 1000 }
 				: {
 						type: answer.type,
 						...(answer.type === "choice" ? { choice: answer.choice } : { score: answer.score }),

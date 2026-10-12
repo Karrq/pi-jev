@@ -1,18 +1,26 @@
-# TODO: migrate pi-jev to pi's built-in classifier support
+# pi-jev classifier migration
 
-pi already knows how to call a TypeSafe-compatible System One endpoint. Instead of
-each extension talking to `/v1/systemone` through `src/client.ts`, register the local
-endpoint once as a classifier provider and let extensions call
-`ctx.modelRegistry.classify(model, { state, questions })`.
+Done. The extensions no longer call `systemOne()` from `src/client.ts`; they call
+`ctx.modelRegistry.classify()` on the `local-jev` provider registered by
+`extensions/provider.ts`.
 
-- First step: `extensions/provider.ts` registers provider `local-jev` and one
-  classifier model pointed at the configured endpoint.
-- Migrate the extensions off `systemOne()` from `src/client.ts`: `bash-gate`,
-  `dropper`, `file-relevance`, `ask-jev`, `model-router`. Delete the client once
-  nothing imports it.
-- Gotcha: the classifier `baseUrl` must include `/v1` (the transport appends
-  `/systemone`), so a url ending in `/v1` must not get a second one.
-- Gotcha: the transport requires a non-empty apiKey. A local open-jev server ignores
-  it, so a dummy value like `local` is fine.
-- Note: pi adds classifier usage to the session cost when the model has a catalog
-  cost. The local model is registered at zero, so a local run stays free.
+## What changed
+
+- `src/classifier.ts` holds the classifier vocabulary, the `providerClassify`
+  implementation `extensions/provider.ts` registers, and a `classify(ctx, ...)`
+  wrapper the extensions use.
+- The model carries api `local-jev-system-one`, not pi's `typesafe-system-one`.
+  pi's built-in parser normalizes score answers to `{ score, confidence }` and
+  drops `legend` and per-level probabilities, which `bash-gate` reads for its
+  block/ask/allow bands and `model-router` reads for depth and length. Upstream
+  still drops them on `main` and in `1.0.4`; there is no issue open for it.
+- Migrated: `ask-jev`, `bash-gate`, `file-relevance`, `model-router`.
+- `test/load.mjs` routes its stub registries through `providerClassify`.
+
+## What stayed
+
+- `extensions/dropper.ts` and `src/drop.ts` still use `src/client.ts`, as agreed.
+  `src/shared.ts`'s `assessCommand` is dead code and also stayed; that keeps
+  `client.ts` in the tree.
+- pi-om's dropper was migrated separately, onto the same provider, in
+  `pi-observational-memory`.

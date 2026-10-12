@@ -1,18 +1,22 @@
 /**
  * jev-provider: the local System One endpoint as a pi classifier provider.
  *
- * pi ships classifier models and a built-in `typesafe-system-one` API. Registering
- * this provider exposes the local open-jev server as provider `local-jev`, so any
- * extension can call `ctx.modelRegistry.getModelOfType("classifier", "local-jev")`
- * and `ctx.modelRegistry.classify(model, { state, questions })` instead of talking to
- * the endpoint through the hand-rolled client in `src/client.ts`. Retiring that client
- * is the point; it is the current alternative until the extensions are migrated.
+ * Registers provider `local-jev`, so any extension can call
+ * `ctx.modelRegistry.getModelsOfType("classifier", "local-jev")` and
+ * `ctx.modelRegistry.classify(model, { state, questions })` instead of talking to
+ * the endpoint through a hand-rolled client. `src/classifier.ts` also exports a
+ * `classify(ctx, ...)` wrapper that resolves the model and adds elapsed time.
  *
- * Two details the built-in transport imposes:
+ * The model carries api `local-jev-system-one`, implemented in `src/classifier.ts`,
+ * rather than pi's built-in `typesafe-system-one`. The built-in parser normalizes
+ * score answers to `{ score, confidence }` and drops `legend` and per-level
+ * probabilities, which the bash gate and model router read.
+ *
+ * Two details the System One transport imposes:
  * - it builds the URL as `<baseUrl>/systemone`, and open-jev serves `/v1/systemone`,
  *   so `baseUrl` must end in `/v1` (the built-in typesafe provider uses `.../v1/`).
- * - it resolves an apiKey before sending and throws when none is found; a local server
- *   ignores the value, so `"local"` is a safe fallback.
+ * - it requires a non-empty apiKey; a local server ignores the value, so `"local"`
+ *   is a safe fallback.
  *
  * The endpoint (url, model, apiKey, headers) comes from pi-jev's settings under the
  * `pi-jev` key, through `resolve(cwd, "provider", trusted)`. It is resolved at load and
@@ -21,13 +25,12 @@
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { API, DEFAULT_MODEL, providerClassify } from "../src/classifier.ts";
 import { ensureLocalService, rootUrlOf } from "../src/autostart.ts";
 import { loadSettings, resolve } from "../src/config.ts";
 import type { JevSettings } from "../src/config.ts";
 
 const PROVIDER = "local-jev";
-const API = "typesafe-system-one";
-const DEFAULT_MODEL = "open-jev";
 const CONTEXT_WINDOW = 128_000;
 
 /** What the last registration resolved to, for the change check on session start. */
@@ -84,9 +87,9 @@ export default function (pi: ExtensionAPI) {
 			contextWindow: CONTEXT_WINDOW,
 		};
 		const config = {
-			api: API,
 			apiKey,
 			models: [model],
+			classifiers: { [API]: { classify: providerClassify } },
 			...(Object.keys(headers).length ? { headers } : {}),
 		};
 		const state: Registered = { baseUrl, id, apiKey, headers };

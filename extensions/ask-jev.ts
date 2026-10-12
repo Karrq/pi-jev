@@ -33,10 +33,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { Usage } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { resolve } from "../src/config.ts";
-import { systemOne } from "../src/client.ts";
-import { formatAnswer, type JevAnswer, type JevQuestion, type QuestionType } from "../src/types.ts";
+import { classify, formatAnswer, noul, type JevAnswer, type JevQuestion, type QuestionType } from "../src/classifier.ts";
 import { endpointLine, failure, numberOption, text } from "../src/shared.ts";
 import { renderBlocks, runCommand, type SourceBlock } from "../src/sources.ts";
 
@@ -106,7 +106,7 @@ export function buildQuestions(specs: Spec[], maxQuestions: number): Record<stri
 			if (criteria.length < 2) throw new Error(`score question ${id} needs at least 2 criteria`);
 			questions[id] = { type: "score", instructions, criteria };
 		} else {
-			questions[id] = { type: "noul", instructions };
+			questions[id] = noul(instructions);
 		}
 	});
 	return questions;
@@ -167,7 +167,7 @@ export default function (pi: ExtensionAPI) {
 				const started = Date.now();
 
 				let answers: Record<string, JevAnswer>;
-				let usage: { input_tokens?: number; output_tokens?: number } = {};
+				let usage: Usage | undefined;
 				let endpointName = endpoint.name;
 				const sources: Record<string, string[]> = {};
 
@@ -177,12 +177,12 @@ export default function (pi: ExtensionAPI) {
 					for (const block of labelled) {
 						// Context plus this source alone, so per-source still means per source.
 						const scoped = context ? `--- context ---\n${context}\n\n--- source ---\n${block.text}` : block.text;
-						const result = await systemOne(endpoint, scoped, questions, { signal, model });
+						const result = await classify(ctx, scoped, questions, { signal, model });
 						usage = result.usage;
-						endpointName = result.endpoint;
+						endpointName = result.provider;
 						for (const [id, answer] of Object.entries(result.answers)) {
 							const confidence =
-								answer.type === "noul" ? Math.abs(answer.noul - 0.5) * 2 : answer.confidence;
+								answer.type === "bool" ? Math.abs(answer.probability - 0.5) * 2 : answer.confidence;
 							const current = best[id];
 							if (!current || confidence > current.confidence) best[id] = { answer, label: block.label, confidence };
 							(sources[id] ??= []).push(block.label);
@@ -191,15 +191,15 @@ export default function (pi: ExtensionAPI) {
 					answers = Object.fromEntries(Object.entries(best).map(([id, b]) => [id, b.answer]));
 					for (const [id, entry] of Object.entries(best)) sources[id] = [entry.label];
 				} else {
-					const result = await systemOne(endpoint, state, questions, { signal, model });
+					const result = await classify(ctx, state, questions, { signal, model });
 					answers = result.answers;
 					usage = result.usage;
-					endpointName = result.endpoint;
+					endpointName = result.provider;
 				}
 
 				const elapsedMs = Date.now() - started;
 				const totalBytes = blocks.reduce((sum, block) => sum + block.originalBytes, 0);
-				const header = `[ask_jev ${endpointName} ${elapsedMs}ms, ${blocks.length} source(s), ${totalBytes} bytes, ${usage.input_tokens ?? "?"} input tokens]`;
+				const header = `[ask_jev ${endpointName} ${elapsedMs}ms, ${blocks.length} source(s), ${totalBytes} bytes, ${usage?.input ?? "?"} input tokens]`;
 				const sourceLine = (label: string) => {
 					const block = labelled.find((entry) => entry.label === label);
 					const bytes = `(${block?.originalBytes ?? 0} bytes${block?.truncated ? ", truncated" : ""})`;
@@ -279,9 +279,7 @@ export default function (pi: ExtensionAPI) {
 							.join("\n")
 					: question;
 			try {
-				const result = await systemOne(endpoint, state || question, {
-					q1: { type: "noul", instructions: question },
-				});
+				const result = await classify(ctx, state || question, { q1: noul(question) });
 				ctx.ui.notify(formatAnswer(result.answers.q1), "info");
 			} catch (error) {
 				ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");

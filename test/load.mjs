@@ -22,6 +22,27 @@ const piRequire = createRequire(`${piDir}/package.json`);
 const alias = { typebox: piRequire.resolve("typebox") };
 const jiti = createJiti(import.meta.url, { interopDefault: true, alias });
 
+// The provider path the extensions now use. jiti strips the type-only imports, so
+// this brings in the transport without pi running.
+const { providerClassify, API: JEV_API } = await jiti.import(join(root, "src/classifier.ts"));
+const { resolve: resolveJev } = await jiti.import(join(root, "src/config.ts"));
+const jevEndpoint = resolveJev(root, "provider", false).endpoint;
+const jevClassifier = {
+	type: "classifier",
+	provider: "local-jev",
+	id: jevEndpoint.model ?? "open-jev",
+	api: JEV_API,
+	baseUrl: `${jevEndpoint.url.replace(/\/+$/, "")}/v1`,
+	headers: jevEndpoint.headers ?? {},
+};
+const jevRegistry = {
+	getModelsOfType: (type, provider) => (type === "classifier" && provider === "local-jev" ? [jevClassifier] : []),
+	findOfType: (type, provider, id) =>
+		type === "classifier" && provider === "local-jev" && jevClassifier.id === id ? jevClassifier : undefined,
+	classify: (model, context, options) =>
+		providerClassify(model, context, { ...options, apiKey: jevEndpoint.apiKey ?? "local" }),
+};
+
 const schemaMode = process.argv.includes("--schema");
 const recorded = [];
 const notified = [];
@@ -75,6 +96,7 @@ const ctx = {
 	],
 	scopedModels: [],
 	model: undefined,
+	modelRegistry: jevRegistry,
 	ui: { notify: (message, level) => { notified.push({ message, level }); console.log(`  [ui.${level}] ${message.split("\n")[0]}`); }, confirm: async () => false },
 };
 
@@ -181,34 +203,33 @@ if (!["--live", "--tools", "--route", "--gate"].some((flag) => process.argv.incl
 
 if (!["--live", "--route", "--gate"].some((flag) => process.argv.includes(flag))) process.exit(0);
 
-// Live check: one small request per extension through the same client the tools use.
+// Live check: one small request per extension through the same classifier the tools use.
 const { resolve } = await jiti.import(join(root, "src/config.ts"));
-const { systemOne } = await jiti.import(join(root, "src/client.ts"));
-const { formatAnswer } = await jiti.import(join(root, "src/types.ts"));
+const { classify, formatAnswer } = await jiti.import(join(root, "src/classifier.ts"));
 
 for (const [extension, state, questions] of [
 	[
 		"jev-decider",
 		"Deploy log: staging is healthy, latency p95 210ms, error rate 0.02%.",
-		{ healthy: { type: "noul", instructions: "Is the service healthy?" } },
+		{ healthy: { type: "bool", instructions: "Is the service healthy?", criteria: { true: "Yes", false: "No" } } },
 	],
 	[
 		"jev-dropper",
 		'Goal: fix the failing login test.\n\nPool:\n[item 0 (a)]\nTest fails: expected 200 got 401 at /login\n\n[item 1 (b)]\nDeployed staging at 12:04\n\n[item 2 (c)]\nLogin returns 401 when the token is expired, which is the failing case',
 		{
-			keep_0: { type: "noul", instructions: "Is item 0 still needed to fix the failing login test?" },
+			keep_0: { type: "bool", instructions: "Is item 0 still needed to fix the failing login test?", criteria: { true: "Yes", false: "No" } },
 			imp_0: { type: "score", instructions: "How important is item 0?", criteria: ["irrelevant", "minor", "useful", "important", "critical"] },
 		},
 	],
 	[
 		"jev-file-relevance",
 		'File: src/auth.ts\nCharacters 0-64 of 64\n\nexport function login(token: string) {\n  if (isExpired(token)) return 401;\n}',
-		{ expiry: { type: "noul", instructions: "Does this file return 401 for an expired token?" } },
+		{ expiry: { type: "bool", instructions: "Does this file return 401 for an expired token?", criteria: { true: "Yes", false: "No" } } },
 	],
 	[
 		"jev-bash-gate",
 		"Working directory: /repo\nCommand: rm -rf node_modules && npm ci",
-		{ safe: { type: "noul", instructions: "Is this command safe to run right now, with no destructive, irreversible or unexpected side effects?" } },
+		{ safe: { type: "bool", instructions: "Is this command safe to run right now, with no destructive, irreversible or unexpected side effects?", criteria: { true: "Yes", false: "No" } } },
 	],
 	[
 		"jev-model-router",
@@ -216,14 +237,14 @@ for (const [extension, state, questions] of [
 		{ model: { type: "choice", instructions: "Which candidate model should handle this task?", criteria: { "anthropic/claude-haiku-4-5": "cheap fast model", "anthropic/claude-opus-5-5": "expensive strong model" } } },
 	],
 ]) {
-	const { endpoint, sources } = resolve(process.cwd(), extension, false);
+	const { sources } = resolve(process.cwd(), extension, false);
 	const started = Date.now();
-	const result = await systemOne(endpoint, state, questions);
+	const result = await classify(ctx, state, questions);
 	const answers = Object.entries(result.answers)
 		.map(([id, answer]) => `${id}=${formatAnswer(answer)}`)
 		.join("  ");
 	console.log(
-		`live ${extension.padEnd(18)} ${endpoint.name} -> ${endpoint.url} [${sources.join(", ") || "no settings"}] ${Date.now() - started}ms  ${answers}`,
+		`live ${extension.padEnd(18)} ${result.provider}/${result.model} [${sources.join(", ") || "no settings"}] ${Date.now() - started}ms  ${answers}`,
 	);
 }
 
@@ -280,6 +301,7 @@ if (process.argv.includes("--route")) {
 		scopedModels: catalog,
 		getScopedModels: () => catalog,
 		modelRegistry: {
+			...jevRegistry,
 			find: (provider, id) => {
 				if (provider === "anthropic" && ANTHROPIC_RATES[id]) {
 					return { provider, id, cost: ANTHROPIC_RATES[id] };
@@ -614,6 +636,7 @@ if (process.argv.includes("--gate")) {
 		isProjectTrusted: () => false,
 		signal: undefined,
 		sessionManager: { getBranch: () => [] },
+		modelRegistry: jevRegistry,
 	appendEntry: (customType, data) => { recorded.push({ customType, data }); },
 	ui: { notify: (message, level) => { notified.push({ message, level }); } },
 		ui: { notify: (message) => notifications.push(message), confirm: async () => confirm },

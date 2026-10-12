@@ -47,7 +47,7 @@
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { resolve } from "../src/config.ts";
-import { systemOne } from "../src/client.ts";
+import { classify } from "../src/classifier.ts";
 import { listOption, matchesAny, numberOption } from "../src/shared.ts";
 
 const EXTENSION = "jev-bash-gate";
@@ -107,13 +107,14 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	async function assess(
+		ctx: ExtensionContext,
 		endpoint: ReturnType<typeof settings>["endpoint"],
 		command: string,
 		cwd: string,
 		signal?: AbortSignal,
 	): Promise<Verdict> {
-		const result = await systemOne(
-			endpoint,
+		const result = await classify(
+			ctx,
 			`Working directory: ${cwd}\nCommand: ${command}`,
 			{
 				does: {
@@ -137,7 +138,7 @@ export default function (pi: ExtensionAPI) {
 					criteria: ["none", "low", "medium", "high"],
 				},
 			},
-			{ signal },
+			{ signal, timeoutMs: endpoint.timeoutMs },
 		);
 		const riskAnswer = result.answers.risk;
 		const doesAnswer = result.answers.does;
@@ -180,7 +181,7 @@ export default function (pi: ExtensionAPI) {
 		let verdict = hit && Date.now() - hit.at < cacheTtlMs ? hit.verdict : undefined;
 		if (!verdict) {
 			try {
-				verdict = await assess(endpoint, command, ctx.cwd, ctx.signal);
+				verdict = await assess(ctx, endpoint, command, ctx.cwd, ctx.signal);
 				cache.set(key, { at: Date.now(), verdict });
 			} catch (error) {
 				ctx.ui.notify(`jev bash gate: ${error instanceof Error ? error.message : String(error)}`, "error");
